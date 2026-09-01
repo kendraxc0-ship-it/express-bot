@@ -2,3 +2,5 @@ pyTelegramBotAPI==4.15.0
 requests==2.31.0
 pycryptodome==3.19.0
 asn1crypto==1.5.1
+Flask==2.3.3
+gunicorn==21.2.0

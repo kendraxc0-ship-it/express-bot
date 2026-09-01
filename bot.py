@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# ExpressVPN Telegram Bot - Minimal Edition
-# Author: @X1n0q | Hex
+# ExpressVPN Telegram Bot - Render-Ready
+# Author: @X1n0q
 
 import sys
 import time
@@ -28,14 +28,29 @@ from asn1crypto import cms, x509, keys
 import telebot
 from telebot import types
 
+# ─── FLASK KEEP-ALIVE ──────────────────────────────────────────────────────
+from flask import Flask
+from threading import Thread
+import os
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "✅ ExpressVPN Bot is alive!"
+
+def run_flask():
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port, debug=False)
+
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 BOT_TOKEN = "8136827302:AAHpATxlggGEUJ_Pw1DVB07eesKaWTlvOn8"
 ADMIN_IDS = {7305141058}
-MAX_WORKERS = 4
+MAX_WORKERS = 2  # ← Optimized for free tier
 RESULTS_DIR = "ExpressVPN_Results"
 
-import os
-os.makedirs(RESULTS_DIR, exist_ok=True)
+import os as _os
+_os.makedirs(RESULTS_DIR, exist_ok=True)
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 shutdown_event = Event()
@@ -662,7 +677,7 @@ def cmd_check(message):
                     reason = data if isinstance(data, str) else "unknown"
                     session["invalid_hits"].append(f"{email}:{password} | {reason}")
             
-            time.sleep(0.8)
+            time.sleep(1.5)  # ← Reduced speed for stability
             update_status()
 
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -739,11 +754,19 @@ def handle_text_combos(message):
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    print("ExpressVPN Bot starting...")
-    print("Author: @X1n0q")
+    print("🚀 ExpressVPN Bot starting...")
+    print("👤 Author: @X1n0q")
+    print("💻 Running on Render.com free tier")
+    
+    # Start Flask keep-alive thread
+    flask_thread = Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    print("🌐 Keep-alive server started on port " + os.environ.get('PORT', '8080'))
+    
+    # Start Telegram bot
     try:
         bot.infinity_polling(timeout=60, long_polling_timeout=60)
     except KeyboardInterrupt:
         shutdown_event.set()
-        print("\nShutting down.")
+        print("\n🛑 Shutting down.")
         sys.exit(0)
